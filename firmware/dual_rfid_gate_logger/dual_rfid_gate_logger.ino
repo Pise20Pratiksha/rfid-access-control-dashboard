@@ -46,7 +46,7 @@
 #define LAN_PROBES_BEFORE_CLOUD 3   // ~6 s of failed LAN discovery, then use cloud
 #if CLOUD_MODE
   #include <WebSocketsClient.h>
-  #define CLOUD_HOST "YOUR-APP-NAME.onrender.com"   // no https://, no trailing slash
+  #define CLOUD_HOST "rfid-access-control.onrender.com"   // no https://, no trailing slash
   #define CLOUD_PORT 443
   #define CLOUD_PATH "/api/device-ws"
   // Optional: pin the server's root CA (PEM string) to stop man-in-the-middle.
@@ -312,8 +312,12 @@ public:
     _ws.onEvent([this](WStype_t type, uint8_t* payload, size_t length) {
       if (type == WStype_CONNECTED) {
         _up = true;
+        DBGLN("[Cloud] WebSocket connected");
       } else if (type == WStype_DISCONNECTED) {
+        if (_up) DBGLN("[Cloud] WebSocket disconnected");
         _up = false;
+      } else if (type == WStype_ERROR) {
+        DBGLN("[Cloud] WebSocket error (check CLOUD_HOST / internet / TLS)");
       } else if (type == WStype_TEXT) {
         _rx += String((const char*)payload).substring(0, length);
         _rx += "\n";
@@ -755,11 +759,18 @@ void attemptTCPConnect() {
     return;
   }
 
-  DBG("[TCP] Connecting to ");
-  DBG(serverIP.toString());
-  DBG(":");
-  DBG(serverPort);
-  DBGLN("...");
+#if CLOUD_MODE
+  if (CLOUD_MODE == 1 || cloudFallback) {
+    DBG("[Cloud] Connecting to wss://"); DBG(CLOUD_HOST); DBGLN(CLOUD_PATH);
+  } else
+#endif
+  {
+    DBG("[TCP] Connecting to ");
+    DBG(serverIP.toString());
+    DBG(":");
+    DBG(serverPort);
+    DBGLN("...");
+  }
 
   tcpClient.stop();
   if (tcpClient.connect(serverIP, serverPort)) {
@@ -841,7 +852,7 @@ void handleServerMessage(const String& line) {
         applyDateTime(sTime);
       }
     } else {
-      DBGLN("[TCP] Authentication rejected by server!");
+      DBGLN("[TCP] Authentication rejected by server! DEVICE_AUTH_KEY must equal the server's DEVICE_AUTH_SECRET.");
       networkStatusText = "Auth Failed";
       idleNeedsFullRedraw = true;
       tcpClient.stop();

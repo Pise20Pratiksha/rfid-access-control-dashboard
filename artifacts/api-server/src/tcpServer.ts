@@ -271,7 +271,17 @@ export async function handleIncomingPacket(
     const firmwareVersion = packet.version || packet.firmwareVersion || "2.1.0";
     const nvsCount = Number(packet.nvsCount ?? packet.recordsCount ?? 0);
 
-    const isValid = verifyDeviceAuth(deviceId, token);
+    // Internet (WebSocket) devices must present the secret. Raw TCP is LAN-only and
+    // stays open as before unless LAN_REQUIRE_DEVICE_AUTH=true.
+    const lanOpen =
+      clientInfo.transport !== "ws" && process.env.LAN_REQUIRE_DEVICE_AUTH !== "true";
+    const tokenOk = verifyDeviceAuth(deviceId, token);
+    if (!tokenOk && lanOpen) {
+      logger.warn(
+        `[TCP Server] Device "${deviceId}" sent an invalid key; accepted because it is on the LAN (set LAN_REQUIRE_DEVICE_AUTH=true to enforce)`
+      );
+    }
+    const isValid = tokenOk || lanOpen;
 
     if (isValid) {
       clientInfo.authenticated = true;
