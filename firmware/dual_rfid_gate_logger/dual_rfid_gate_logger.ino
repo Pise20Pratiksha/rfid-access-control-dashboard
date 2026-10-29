@@ -42,7 +42,7 @@
 //                   when it is not found (recommended: works at home AND away)
 //  Modes 1 and 2 need the Arduino library "WebSockets" by Markus Sattler (2.4+).
 // ─────────────────────────────────────────────────────────────
-#define CLOUD_MODE 2
+#define CLOUD_MODE 0
 #define LAN_PROBES_BEFORE_CLOUD 3   // ~6 s of failed LAN discovery, then use cloud
 #if CLOUD_MODE
   #include <WebSocketsClient.h>
