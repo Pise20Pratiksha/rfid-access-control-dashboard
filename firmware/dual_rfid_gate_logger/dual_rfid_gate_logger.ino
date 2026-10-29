@@ -744,6 +744,13 @@ void sendDiscoveryProbeUDP() {
 void sendAuthRequest() {
   if (!tcpClient || !tcpClient.connected()) return;
 
+  if (String(DEVICE_AUTH_KEY).startsWith("CHANGE_ME")) {
+    DBGLN("[AUTH] *** DEVICE_AUTH_KEY is still the placeholder! Set it to the server's DEVICE_AUTH_SECRET and re-flash. ***");
+    networkStatusText = "Set DEVICE_AUTH_KEY";
+    idleNeedsFullRedraw = true;
+  }
+  DBG("[AUTH] Sending key of length "); DBGLN(String(DEVICE_AUTH_KEY).length());
+
   String authMsg = "{\"type\":\"auth_request\",\"deviceId\":\"" + getPermanentDeviceId() +
                    "\",\"name\":\"ESP32 Gate Logger\",\"token\":\"" + String(DEVICE_AUTH_KEY) +
                    "\",\"mac\":\"" + deviceMacAddress + "\",\"ip\":\"" + ipString +

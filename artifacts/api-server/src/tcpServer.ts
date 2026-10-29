@@ -13,6 +13,7 @@ import {
   associateSocket,
   markDeviceOffline,
   verifyDeviceAuth,
+  DEVICE_AUTH_SECRET,
   resolveDevice,
   sendDeviceCommand,
   getLiveDevices,
@@ -342,7 +343,9 @@ export async function handleIncomingPacket(
       }
     } else {
       logger.warn(
-        `[TCP Server] Device "${deviceId}" FAILED authentication from ${remoteAddress}. Invalid token!`
+        `[TCP Server] Device "${deviceId}" FAILED authentication from ${remoteAddress}. Invalid token! ` +
+          `(device key length ${String(token).length}, server secret length ${DEVICE_AUTH_SECRET.length}` +
+          `${String(token).startsWith("CHANGE_ME") ? "; device is still using the CHANGE_ME placeholder" : ""})`
       );
       const authFailResp = {
         type: "auth_response",
