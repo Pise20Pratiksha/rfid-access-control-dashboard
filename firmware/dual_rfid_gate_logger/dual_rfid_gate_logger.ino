@@ -35,13 +35,15 @@
 #include <WebServer.h>
 
 // ─────────────────────────────────────────────────────────────
-//  CLOUD MODE (Render / any HTTPS host)
-//  1 = connect out to wss://CLOUD_HOST/api/device-ws (works from any Wi-Fi,
-//      no mDNS / UDP discovery / open ports needed)
-//  0 = legacy LAN mode (UDP + mDNS discovery, raw TCP to the local server)
-//  Requires the Arduino library "WebSockets" by Markus Sattler (v2.4+).
+//  CONNECTION MODE
+//  0 = LAN only   : UDP + mDNS discovery, raw TCP to the local server
+//  1 = CLOUD only : wss://CLOUD_HOST/api/device-ws (works from any Wi-Fi)
+//  2 = AUTO       : try the local LAN server first, fall back to the cloud
+//                   when it is not found (recommended: works at home AND away)
+//  Modes 1 and 2 need the Arduino library "WebSockets" by Markus Sattler (2.4+).
 // ─────────────────────────────────────────────────────────────
-#define CLOUD_MODE 1
+#define CLOUD_MODE 2
+#define LAN_PROBES_BEFORE_CLOUD 3   // ~6 s of failed LAN discovery, then use cloud
 #if CLOUD_MODE
   #include <WebSocketsClient.h>
   #define CLOUD_HOST "YOUR-APP-NAME.onrender.com"   // no https://, no trailing slash
@@ -290,12 +292,18 @@ RTC_DS3231       rtc;
 
 WiFiUDP          udpDiscovery;
 #if CLOUD_MODE
-// Drop-in replacement for WiFiClient: same newline-delimited JSON protocol,
-// carried one message per WebSocket text frame over TLS (wss://).
-class WsLineClient {
+bool    cloudFallback = false;   // true = current session goes through the cloud
+uint8_t lanProbeCount = 0;
+
+// Drop-in replacement for WiFiClient. Same newline-delimited JSON protocol,
+// carried either over raw TCP (LAN) or one message per WebSocket text frame
+// over TLS (wss://, cloud) depending on cloudFallback.
+class HybridClient {
 public:
-  bool connect(IPAddress, uint16_t) {
+  bool connect(IPAddress ip, uint16_t port) {
     _rx = ""; _out = ""; _up = false;
+    _cloud = (CLOUD_MODE == 1) || cloudFallback;
+    if (!_cloud) return _tcp.connect(ip, port);
 #ifdef CLOUD_ROOT_CA
     _ws.beginSslWithCA(CLOUD_HOST, CLOUD_PORT, CLOUD_PATH, CLOUD_ROOT_CA);
 #else
@@ -317,27 +325,51 @@ public:
     while (!_up && millis() - start < 8000) { _ws.loop(); delay(10); }
     return _up;
   }
-  void setNoDelay(bool) {}
-  bool connected() { _ws.loop(); return _up; }
-  int  available() { _ws.loop(); return _rx.length(); }
-  String readStringUntil(char) {
+  void setNoDelay(bool v) { if (!_cloud) _tcp.setNoDelay(v); }
+  bool connected() {
+    if (!_cloud) return _tcp.connected();
+    _ws.loop();
+    return _up;
+  }
+  int available() {
+    if (!_cloud) return _tcp.available();
+    _ws.loop();
+    return _rx.length();
+  }
+  String readStringUntil(char term) {
+    if (!_cloud) return _tcp.readStringUntil(term);
     int nl = _rx.indexOf('\n');
     if (nl < 0) { String all = _rx; _rx = ""; return all; }
     String line = _rx.substring(0, nl);
     _rx.remove(0, nl + 1);
     return line;
   }
-  size_t print(const String& s) { _out += s; if (_out.endsWith("\n")) flush(); return s.length(); }
-  size_t print(const char* s)   { return print(String(s)); }
-  void flush() { if (_out.length() && _up) _ws.sendTXT(_out); _out = ""; }
-  void stop()  { _ws.disconnect(); _up = false; _rx = ""; _out = ""; }
-  explicit operator bool() const { return _up; }
+  size_t print(const String& s) {
+    if (!_cloud) return _tcp.print(s);
+    _out += s;
+    if (_out.endsWith("\n")) flush();
+    return s.length();
+  }
+  size_t print(const char* s) { return print(String(s)); }
+  void flush() {
+    if (!_cloud) { _tcp.flush(); return; }
+    if (_out.length() && _up) _ws.sendTXT(_out);
+    _out = "";
+  }
+  void stop() {
+    _tcp.stop();
+    if (_cloud) _ws.disconnect();
+    _up = false; _rx = ""; _out = "";
+  }
+  explicit operator bool() { return connected(); }
 private:
+  WiFiClient       _tcp;
   WebSocketsClient _ws;
   String _rx, _out;
-  bool   _up = false;
+  bool   _up    = false;
+  bool   _cloud = false;
 };
-WsLineClient     tcpClient;
+HybridClient     tcpClient;
 #else
 WiFiClient       tcpClient;
 #endif
@@ -654,14 +686,26 @@ void serviceIncomingUDPDiscovery() {
 void sendDiscoveryProbeUDP() {
   if (WiFi.status() != WL_CONNECTED) return;
 
-#if CLOUD_MODE
-  // The server is a fixed public hostname: nothing to discover.
+#if CLOUD_MODE == 1
+  // Cloud only: the server is a fixed public hostname, nothing to discover.
   hostnameResolved = true;
   networkStatusText = "Cloud Server";
   netState = STATE_CONNECTING_TCP;
   lastTcpAttemptMs = 0;
   idleNeedsFullRedraw = true;
   return;
+#elif CLOUD_MODE == 2
+  // Auto: probe the LAN a few times; if no local server answers, use the cloud.
+  if (cloudFallback || ++lanProbeCount > LAN_PROBES_BEFORE_CLOUD) {
+    cloudFallback = true;
+    hostnameResolved = true;
+    networkStatusText = "Cloud Server";
+    netState = STATE_CONNECTING_TCP;
+    lastTcpAttemptMs = 0;
+    idleNeedsFullRedraw = true;
+    DBGLN("[Discovery] No LAN server found, using cloud server");
+    return;
+  }
 #endif
 
   DBG("[Discovery] Broadcasting UDP probe to 255.255.255.255:"); DBGLN(UDP_DISCOVERY_PORT);
@@ -724,6 +768,9 @@ void attemptTCPConnect() {
     isAuthenticated = false;
     tcpConnectFailCount = 0;
     resolveFailCount = 0;
+#if CLOUD_MODE == 2
+    if (!cloudFallback) lanProbeCount = 0;   // LAN works: keep preferring it
+#endif
     lastPingSentMs = millis();
     lastServerRxMs = millis();
     lastAuthAttemptMs = millis();
@@ -984,6 +1031,10 @@ void serviceNetwork() {
     if (WiFi.status() != WL_CONNECTED) {
       if (netState != STATE_WIFI_DISCONNECTED) {
         DBGLN("[WiFi] Connection dropped!");
+#if CLOUD_MODE == 2
+        cloudFallback = false;
+        lanProbeCount = 0;
+#endif
         tcpClient.stop();
         isAuthenticated = false;
         hostnameResolved = false;

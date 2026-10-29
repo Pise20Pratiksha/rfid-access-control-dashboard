@@ -117,18 +117,24 @@ with the env vars from `render.yaml` (`NODE_VERSION=22`, `NODE_ENV=production`,
 Create a free monitor at <https://uptimerobot.com>: HTTP(s), URL
 `https://<name>.onrender.com/api/healthz`, interval 5 minutes.
 
-## Step 5 - Flash the controller
+## Step 5 - Flash the controller (works on BOTH local and cloud)
 
 In `firmware/dual_rfid_gate_logger/dual_rfid_gate_logger.ino`:
 
 1. Arduino IDE > Library Manager: install **WebSockets** by Markus Sattler.
-2. Set `CLOUD_HOST` to your host without `https://` (e.g. `rfid-access-control.onrender.com`).
-3. Set `DEVICE_AUTH_KEY` to the exact `DEVICE_AUTH_SECRET` you gave Render
-   (do not commit this edit).
-4. Set your Wi-Fi SSID/password and upload. Any Wi-Fi with internet access works.
+2. `CLOUD_MODE` is `2` (AUTO) by default: the board first looks for your local
+   server (`rfid-app.local`, ~6 s); if none answers it connects to the cloud.
+   Use `0` for LAN only or `1` for cloud only.
+3. Set `CLOUD_HOST` to your host without `https://`
+   (e.g. `rfid-access-control.onrender.com`).
+4. Set `DEVICE_AUTH_KEY` to your secret. **Use the same value** as Render's
+   `DEVICE_AUTH_SECRET` and as `DEVICE_AUTH_SECRET` in your local `.env`, so the
+   same board authenticates to both servers. Do not commit this edit.
+5. Set your Wi-Fi SSID/password and upload.
 
-The TFT shows "Cloud Server" then "Online (Auth OK)"; the Devices page lists the
-gate with transport `ws`.
+At the office the board joins the local server; anywhere else (any Wi-Fi with
+internet) it joins the cloud. The local and cloud dashboards keep separate
+databases. The TFT shows "Cloud Server" when it falls back to the cloud.
 
 ## Testing
 
