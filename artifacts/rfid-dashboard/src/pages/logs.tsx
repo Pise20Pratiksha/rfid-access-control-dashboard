@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useListAccessLogs } from "@workspace/api-client-react";
 import { format } from "date-fns";
 import { Activity, Search, AlertTriangle, ArrowRight, ArrowLeft, Download, Filter } from "lucide-react";
+import { useTagDetection } from "@/context/tag-detection-context";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,6 +13,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 export default function Logs() {
+  const { openRegisterModal } = useTagDetection();
   const [search, setSearch] = useState("");
   const [direction, setDirection] = useState<string>("ALL");
   const [authFilter, setAuthFilter] = useState<string>("ALL");
@@ -133,7 +135,7 @@ export default function Logs() {
                 </TableRow>
               ) : (
                 logPage?.items.map(log => (
-                  <TableRow key={log.id} className="border-border hover:bg-white/5 border-b border-border/40 font-mono text-sm">
+                  <TableRow key={log.id} className="border-border hover:bg-accent/60 border-b border-border/40 font-mono text-sm">
                     <TableCell className="text-muted-foreground whitespace-nowrap">
                       {format(new Date(log.timestamp), 'yyyy-MM-dd HH:mm:ss')}
                     </TableCell>
@@ -148,7 +150,10 @@ export default function Logs() {
                       {log.plateNumber ? (
                         <div>
                           <span className="font-bold text-foreground mr-2">{log.plateNumber}</span>
-                          <span className="text-muted-foreground text-xs">{log.ownerName}</span>
+                          <span className="text-foreground text-xs">{log.ownerName}</span>
+                          {log.carDetails && (
+                            <div className="text-muted-foreground text-[11px]">{log.carDetails}</div>
+                          )}
                         </div>
                       ) : (
                         <span className="text-muted-foreground text-xs italic">UNKNOWN VEHICLE</span>
@@ -160,7 +165,18 @@ export default function Logs() {
                       {log.authorized ? (
                         <Badge variant="outline" className="border-success/30 text-success bg-success/10 font-mono text-[10px]">AUTHORIZED</Badge>
                       ) : (
-                        <Badge variant="outline" className="border-destructive text-destructive bg-destructive/10 font-mono text-[10px] animate-pulse">DENIED</Badge>
+                        <div className="flex items-center justify-end gap-1.5">
+                          <Badge variant="outline" className="border-destructive text-destructive bg-destructive/10 font-mono text-[10px]">DENIED</Badge>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-6 px-2 text-[10px] font-mono border-primary/40 text-primary hover:bg-primary/10"
+                            onClick={() => openRegisterModal(log.cardUid)}
+                            title={`Register tag ${log.cardUid}`}
+                          >
+                            + REGISTER
+                          </Button>
+                        </div>
                       )}
                     </TableCell>
                   </TableRow>

@@ -10,7 +10,22 @@ if (!process.env.DATABASE_URL) {
   );
 }
 
-export const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const dbUrl = process.env.DATABASE_URL;
+const isLocalhost = dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1");
+const requiresSsl =
+  !isLocalhost &&
+  (dbUrl.includes("sslmode=require") ||
+    dbUrl.includes("neon.tech") ||
+    dbUrl.includes("supabase.co") ||
+    dbUrl.includes("render.com") ||
+    dbUrl.includes("aivencloud.com") ||
+    process.env.DATABASE_SSL === "true" ||
+    process.env.NODE_ENV === "production");
+
+export const pool = new Pool({
+  connectionString: dbUrl,
+  ...(requiresSsl ? { ssl: { rejectUnauthorized: false } } : {}),
+});
 export const db = drizzle(pool, { schema });
 
 export * from "./schema";

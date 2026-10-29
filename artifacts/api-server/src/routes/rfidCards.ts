@@ -1,6 +1,6 @@
 import { Router, type IRouter } from "express";
 import { desc, eq } from "drizzle-orm";
-import { db, rfidCardsTable } from "@workspace/db";
+import { db, rfidCardsTable, accessLogsTable } from "@workspace/db";
 import {
   CreateRfidCardBody,
   UpdateRfidCardParams,
@@ -26,10 +26,37 @@ router.post("/rfid-cards", async (req, res): Promise<void> => {
     return;
   }
 
-  const [card] = await db
-    .insert(rfidCardsTable)
-    .values(parsed.data)
-    .returning();
+  const [existing] = await db
+    .select()
+    .from(rfidCardsTable)
+    .where(eq(rfidCardsTable.cardUid, parsed.data.cardUid));
+
+  let card;
+  if (existing) {
+    [card] = await db
+      .update(rfidCardsTable)
+      .set({
+        vehicleId: parsed.data.vehicleId ?? existing.vehicleId,
+        active: parsed.data.active ?? existing.active,
+      })
+      .where(eq(rfidCardsTable.id, existing.id))
+      .returning();
+  } else {
+    [card] = await db
+      .insert(rfidCardsTable)
+      .values(parsed.data)
+      .returning();
+  }
+
+  if (card && card.vehicleId) {
+    await db
+      .update(accessLogsTable)
+      .set({
+        vehicleId: card.vehicleId,
+        authorized: card.active,
+      })
+      .where(eq(accessLogsTable.cardUid, card.cardUid));
+  }
 
   broadcast("rfid_card_created", card);
   res.status(201).json(card);

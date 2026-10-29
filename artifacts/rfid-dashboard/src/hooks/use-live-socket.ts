@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
+import { useTagDetection } from "@/context/tag-detection-context";
 
 type ConnectionStatus = "connecting" | "connected" | "disconnected" | "reconnecting";
 
@@ -9,6 +9,13 @@ export function useLiveSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
   const queryClient = useQueryClient();
+  const { handleTagDetected } = useTagDetection();
+
+  // Keep a ref to handleTagDetected so connect callback doesn't rebind unnecessarily
+  const handleTagDetectedRef = useRef(handleTagDetected);
+  useEffect(() => {
+    handleTagDetectedRef.current = handleTagDetected;
+  }, [handleTagDetected]);
 
   useEffect(() => {
     let mounted = true;
@@ -45,6 +52,10 @@ export function useLiveSocket() {
           if (eventType === "device-deleted") eventType = "esp_device_deleted";
           if (eventType === "device-status") eventType = "esp_device_heartbeat";
 
+          if (eventType === "tag_detected" && data.payload) {
+            handleTagDetectedRef.current(data.payload);
+          }
+
           if (eventType === "access_log_created" && data.payload) {
             const log = data.payload;
             // Invalidate lists to fetch the latest log
@@ -52,17 +63,19 @@ export function useLiveSocket() {
             queryClient.invalidateQueries({ queryKey: ["/api/analytics/summary"] });
             queryClient.invalidateQueries({ queryKey: ["/api/analytics/daily"] });
             
-            // Show alert for unauthorized
-            if (!log.authorized) {
-              toast.error(
-                `Unauthorized Access Attempt`,
-                {
-                  description: `Card ${log.cardUid} attempted entry at ${log.deviceName || 'Unknown Gate'}`,
-                  duration: 6000,
-                  className: "bg-destructive text-destructive-foreground border-destructive"
-                }
-              );
-            }
+            // Forward to tag detection system (handles de-duplication internally)
+            handleTagDetectedRef.current({
+              cardUid: log.cardUid,
+              isRegistered: log.isRegistered ?? log.authorized,
+              authorized: Boolean(log.authorized),
+              direction: log.direction || "IN",
+              deviceId: log.deviceId,
+              deviceName: log.deviceName,
+              plateNumber: log.plateNumber,
+              ownerName: log.ownerName,
+              carDetails: log.carDetails,
+              timestamp: log.timestamp || new Date().toISOString(),
+            });
           }
 
           if (eventType?.startsWith("esp_device_") || eventType === "esp_device_heartbeat") {

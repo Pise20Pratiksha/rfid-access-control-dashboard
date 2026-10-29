@@ -5,7 +5,7 @@ import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { format } from "date-fns";
-import { Cpu, Plus, Edit2, Trash2, CheckCircle2, XCircle, Search } from "lucide-react";
+import { Cpu, Plus, Edit2, Trash2, CheckCircle2, XCircle, Search, DoorOpen } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -201,6 +201,32 @@ export default function Devices() {
                       {device.lastSeenAt ? format(new Date(device.lastSeenAt), 'MMM dd, HH:mm:ss') : 'NEVER'}
                     </TableCell>
                     <TableCell className="text-right space-x-2">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8 text-primary hover:text-primary hover:bg-primary/10"
+                        title="Trigger Gate Barrier Open"
+                        data-testid={`button-open-gate-${device.id}`}
+                        onClick={async () => {
+                          try {
+                            const res = await fetch(`/api/devices/${encodeURIComponent(device.name)}/command`, {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ cmd: "open_gate" }),
+                            });
+                            if (res.ok) {
+                              toast.success(`Gate barrier trigger sent to ${device.name}`);
+                            } else {
+                              toast.error(`Device ${device.name} is currently offline or unreachable`);
+                            }
+                          } catch {
+                            toast.error("Failed to send command to device");
+                          }
+                        }}
+                      >
+                        <DoorOpen className="h-4 w-4" />
+                      </Button>
+
                       <Dialog open={editingDevice?.id === device.id} onOpenChange={(open) => {
                         if (open) {
                           setEditingDevice(device);

@@ -6,6 +6,7 @@ export const vehiclesTable = pgTable("vehicles", {
   id: serial("id").primaryKey(),
   plateNumber: text("plate_number").notNull(),
   ownerName: text("owner_name").notNull(),
+  carDetails: text("car_details"),
   vehicleType: text("vehicle_type").notNull().default("car"),
   status: text("status").notNull().default("active"),
   createdAt: timestamp("created_at", { withTimezone: true })

@@ -4,6 +4,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AuthGuard } from "@/components/auth-guard";
 import { AppLayout } from "@/components/layout";
+import { TagDetectionProvider } from "@/context/tag-detection-context";
 import NotFound from "@/pages/not-found";
 
 import Dashboard from "@/pages/dashboard";
@@ -43,12 +44,14 @@ function Router() {
 function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <TooltipProvider>
-        <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
-          <Router />
-        </WouterRouter>
-        <Toaster theme="dark" position="top-right" richColors />
-      </TooltipProvider>
+      <TagDetectionProvider>
+        <TooltipProvider>
+          <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
+            <Router />
+          </WouterRouter>
+          <Toaster theme="light" position="top-right" richColors />
+        </TooltipProvider>
+      </TagDetectionProvider>
     </QueryClientProvider>
   );
 }

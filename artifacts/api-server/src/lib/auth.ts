@@ -85,10 +85,31 @@ export function getSessionId(req: Request): string | undefined {
   return req.cookies?.[SESSION_COOKIE];
 }
 
+function safeEqual(a: string, b: string): boolean {
+  // Hash first so the comparison is constant-time regardless of input length.
+  const ha = crypto.createHash("sha256").update(a).digest();
+  const hb = crypto.createHash("sha256").update(b).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+/** Refuses to boot a production server that still uses the published default login. */
+export function assertProductionCredentials(): void {
+  if (process.env.NODE_ENV !== "production") return;
+  const user = process.env.ADMIN_USERNAME?.trim();
+  const pass = process.env.ADMIN_PASSWORD;
+  if (!user || !pass || pass === "admin" || pass.length < 10) {
+    throw new Error(
+      "ADMIN_USERNAME and a strong ADMIN_PASSWORD (10+ chars, not the default) must be set in production",
+    );
+  }
+}
+
 export function validateLocalCredentials(username: string, password: string): boolean {
   const adminUser = process.env.ADMIN_USERNAME ?? "admin";
   const adminPass = process.env.ADMIN_PASSWORD ?? "admin";
-  return username === adminUser && password === adminPass;
+  const userOk = safeEqual(username, adminUser);
+  const passOk = safeEqual(password, adminPass);
+  return userOk && passOk;
 }
 
 export function makeLocalUser(): AuthUser {

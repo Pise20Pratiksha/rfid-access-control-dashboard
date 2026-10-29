@@ -23,7 +23,35 @@ import {
 
 const OIDC_COOKIE_TTL = 10 * 60 * 1000;
 const IS_REPLIT = !!process.env.REPL_ID;
-const IS_HTTPS = IS_REPLIT;
+const IS_HTTPS =
+  process.env.COOKIE_SECURE != null
+    ? process.env.COOKIE_SECURE === "true"
+    : IS_REPLIT || process.env.NODE_ENV === "production";
+
+// Basic brute-force protection for the password login (per client IP).
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_FAILURES = 10;
+const loginFailures = new Map<string, { count: number; resetAt: number }>();
+
+function loginLocked(ip: string): boolean {
+  const entry = loginFailures.get(ip);
+  if (!entry) return false;
+  if (entry.resetAt < Date.now()) {
+    loginFailures.delete(ip);
+    return false;
+  }
+  return entry.count >= LOGIN_MAX_FAILURES;
+}
+
+function recordLoginFailure(ip: string): void {
+  const now = Date.now();
+  const entry = loginFailures.get(ip);
+  if (!entry || entry.resetAt < now) {
+    loginFailures.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+  } else {
+    entry.count++;
+  }
+}
 
 const router: IRouter = Router();
 
@@ -107,11 +135,19 @@ router.post("/login", async (req: Request, res: Response) => {
     return;
   }
 
+  const ip = req.ip ?? "unknown";
+  if (loginLocked(ip)) {
+    res.status(429).json({ error: "Too many failed attempts. Try again later." });
+    return;
+  }
+
   if (!validateLocalCredentials(username, password)) {
+    recordLoginFailure(ip);
     res.status(401).json({ error: "Invalid username or password" });
     return;
   }
 
+  loginFailures.delete(ip);
   const user = makeLocalUser();
   const sessionData: SessionData = {
     user,

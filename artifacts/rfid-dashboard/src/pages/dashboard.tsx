@@ -8,13 +8,18 @@ import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YA
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useGateLoggerDump } from "@/hooks/use-gate-logger";
+import { useTagDetection } from "@/context/tag-detection-context";
+import { Button } from "@/components/ui/button";
 
 function StatCard({ title, value, icon: Icon, description, isLoading, className }: any) {
   return (
-    <Card className={`border-border bg-card/50 backdrop-blur ${className}`}>
+    <Card className={`group relative overflow-hidden hover:-translate-y-0.5 animate-rise ${className}`}>
+      <div className="absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-blue-500 to-sky-400 opacity-70" />
       <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-        <CardTitle className="text-sm font-mono font-medium text-muted-foreground uppercase tracking-wider">{title}</CardTitle>
-        <Icon className="h-4 w-4 text-muted-foreground" />
+        <CardTitle className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{title}</CardTitle>
+        <div className="rounded-xl bg-gradient-to-br from-blue-50 to-sky-100 p-2 text-primary transition-transform duration-300 group-hover:scale-110">
+          <Icon className="h-4 w-4" />
+        </div>
       </CardHeader>
       <CardContent>
         {isLoading ? (
@@ -29,11 +34,12 @@ function StatCard({ title, value, icon: Icon, description, isLoading, className 
 }
 
 export default function Dashboard() {
+  const { openRegisterModal } = useTagDetection();
   const { data: summary, isLoading: isLoadingSummary } = useGetAnalyticsSummary();
   const { data: dailyAnalytics, isLoading: isLoadingDaily } = useGetDailyAnalytics({ days: 7 });
   const { data: usageAnalytics, isLoading: isLoadingUsage } = useGetVehicleUsageAnalytics({ limit: 5 });
   const { data: recentLogs, isLoading: isLoadingLogs } = useListAccessLogs({ pageSize: 10, page: 1, sortBy: "timestamp", sortOrder: "desc" });
-  const gateLogger = useGateLoggerDump();
+  useGateLoggerDump();
 
   return (
     <div className="space-y-6">
@@ -83,46 +89,8 @@ export default function Dashboard() {
         />
       </div>
 
-      <Card className="border-border bg-card/50 backdrop-blur">
-        <CardHeader className="pb-3">
-          <CardTitle className="font-mono uppercase tracking-wider text-sm text-muted-foreground flex items-center justify-between gap-3">
-            <span>RFID Firmware Feed</span>
-            <Badge variant="outline" className={gateLogger.status === "connected" ? "border-success/50 text-success bg-success/10" : "border-destructive/50 text-destructive bg-destructive/10"}>
-              {gateLogger.status === "connected" ? `CONNECTED ? ${gateLogger.records.length} RECORDS` : "DEVICE OFFLINE"}
-            </Badge>
-          </CardTitle>
-          <CardDescription className="font-mono text-xs">{gateLogger.url}/dump ? refreshes every 2 seconds</CardDescription>
-          {gateLogger.stats && (
-            <div className="grid grid-cols-2 gap-x-4 gap-y-1 px-6 pb-3 font-mono text-xs text-muted-foreground sm:grid-cols-5">
-              <span>STORED: {gateLogger.stats.count}/{gateLogger.stats.max}</span>
-              <span>TOTAL: {gateLogger.stats.total}</span>
-              <span>HEAD: {gateLogger.stats.head}</span>
-              <span>TAIL: {gateLogger.stats.tail}</span>
-              <span>SAVED IN WEB: {gateLogger.records.length}</span>
-            </div>
-          )}
-        </CardHeader>
-        <CardContent>
-          {gateLogger.status === "disconnected" ? (
-            <p className="font-mono text-sm text-destructive">{gateLogger.error}. Connect this computer to GateLogger Wi-Fi, then reload.</p>
-          ) : gateLogger.records.length === 0 ? (
-            <p className="font-mono text-sm text-muted-foreground">NO RFID DETECTIONS RECEIVED</p>
-          ) : (
-            <div className="space-y-2">
-              {gateLogger.records.slice(0, 10).map((record) => (
-                <div key={`${record.idx}-${record.epc}-${record.date}-${record.time}`} className="grid grid-cols-[80px_1fr_110px] gap-3 border-b border-border/50 pb-2 font-mono text-sm last:border-0">
-                  <span className={record.dir === "IN" ? "text-success" : "text-primary"}>{record.dir}</span>
-                  <span className="truncate">{record.epc}</span>
-                  <span className="text-right text-muted-foreground">{record.date} {record.time}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-7">
-        <Card className="col-span-4 border-border bg-card/50 backdrop-blur">
+        <Card className="col-span-4 border-border ">
           <CardHeader>
             <CardTitle className="font-mono uppercase tracking-wider text-sm text-muted-foreground">7-Day Traffic Flow</CardTitle>
           </CardHeader>
@@ -163,7 +131,7 @@ export default function Dashboard() {
           </CardContent>
         </Card>
 
-        <Card className="col-span-3 border-border bg-card/50 backdrop-blur flex flex-col">
+        <Card className="col-span-3 border-border  flex flex-col">
           <CardHeader>
             <CardTitle className="font-mono uppercase tracking-wider text-sm text-muted-foreground">Live Activity Feed</CardTitle>
           </CardHeader>
@@ -192,10 +160,23 @@ export default function Dashboard() {
                         <div>
                           <div className="font-mono text-sm font-medium flex items-center gap-2">
                             <span data-testid={`log-plate-${log.id}`}>{log.plateNumber || 'UNKNOWN VEHICLE'}</span>
-                            {!log.authorized && <Badge variant="destructive" className="text-[10px] px-1 py-0 h-4 rounded-sm uppercase">Denied</Badge>}
+                            {!log.authorized && (
+                              <div className="flex items-center gap-1.5">
+                                <Badge variant="destructive" className="text-[10px] px-1 py-0 h-4 rounded-sm uppercase">Denied</Badge>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-4 px-1.5 text-[9px] font-mono border-primary/40 text-primary hover:bg-primary/10"
+                                  onClick={() => openRegisterModal(log.cardUid)}
+                                  title={`Register tag ${log.cardUid}`}
+                                >
+                                  + REGISTER
+                                </Button>
+                              </div>
+                            )}
                           </div>
                           <div className="text-xs text-muted-foreground font-mono mt-0.5" data-testid={`log-device-${log.id}`}>
-                            {log.deviceName || 'Unknown Gate'} • Card {log.cardUid.substring(0, 8)}...
+                            {log.ownerName ? `${log.ownerName} • ` : ''}{log.carDetails ? `${log.carDetails} • ` : ''}{log.deviceName || 'Unknown Gate'} • Card {log.cardUid.substring(0, 8)}...
                           </div>
                         </div>
                       </div>
@@ -212,7 +193,7 @@ export default function Dashboard() {
         </Card>
       </div>
       
-      <Card className="border-border bg-card/50 backdrop-blur">
+      <Card className="border-border ">
         <CardHeader>
           <CardTitle className="font-mono uppercase tracking-wider text-sm text-muted-foreground">Vehicle Usage Leaderboard</CardTitle>
           <CardDescription className="font-mono text-xs">Top 5 vehicles by access frequency</CardDescription>

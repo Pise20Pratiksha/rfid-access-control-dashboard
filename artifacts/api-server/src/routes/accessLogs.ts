@@ -23,6 +23,7 @@ function selectAccessLogRow() {
       vehicleId: accessLogsTable.vehicleId,
       plateNumber: vehiclesTable.plateNumber,
       ownerName: vehiclesTable.ownerName,
+      carDetails: vehiclesTable.carDetails,
       direction: accessLogsTable.direction,
       authorized: accessLogsTable.authorized,
       deviceId: accessLogsTable.deviceId,
@@ -128,6 +129,7 @@ router.post("/access-logs", async (req, res): Promise<void> => {
     .from(rfidCardsTable)
     .where(eq(rfidCardsTable.cardUid, cardUid));
 
+  const isRegistered = Boolean(card);
   const authorized = Boolean(card?.active);
 
   const [log] = await db
@@ -150,8 +152,29 @@ router.post("/access-logs", async (req, res): Promise<void> => {
 
   const [enriched] = await selectAccessLogRow().where(eq(accessLogsTable.id, log!.id));
 
-  broadcast("access-log", enriched);
-  res.status(201).json(enriched);
+  if (enriched) {
+    const payload = {
+      ...enriched,
+      isRegistered,
+    };
+    broadcast("access-log", payload);
+    broadcast("access_log_created", payload);
+    broadcast("tag_detected", {
+      cardUid,
+      isRegistered,
+      authorized,
+      direction,
+      deviceId,
+      deviceName: enriched.deviceName,
+      plateNumber: enriched.plateNumber,
+      ownerName: enriched.ownerName,
+      carDetails: enriched.carDetails,
+      timestamp: enriched.timestamp.toISOString(),
+    });
+    res.status(201).json(payload);
+  } else {
+    res.status(201).json(log);
+  }
 });
 
 export default router;

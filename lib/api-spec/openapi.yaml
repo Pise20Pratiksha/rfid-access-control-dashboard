@@ -88,7 +88,6 @@ paths:
           required: false
           schema:
             type: string
-            format: uri
       responses:
         '302':
           description: Redirect to the `returnTo` path on success (defaults to `/`) or `/api/login` on failure.
@@ -629,7 +628,6 @@ components:
           type: string
         email:
           type: [string, 'null']
-          format: email
         firstName:
           type: [string, 'null']
         lastName:
@@ -657,7 +655,6 @@ components:
         redirect_uri:
           type: string
           minLength: 1
-          format: uri
         state:
           type: string
           minLength: 1
@@ -748,6 +745,8 @@ components:
           type: string
         ownerName:
           type: string
+        carDetails:
+          type: [string, 'null']
         vehicleType:
           type: string
           enum: [car, bike, truck, bus, other]
@@ -767,6 +766,8 @@ components:
         ownerName:
           type: string
           minLength: 1
+        carDetails:
+          type: string
         vehicleType:
           type: string
           enum: [car, bike, truck, bus, other]
@@ -782,6 +783,8 @@ components:
         ownerName:
           type: string
           minLength: 1
+        carDetails:
+          type: string
         vehicleType:
           type: string
           enum: [car, bike, truck, bus, other]
@@ -839,6 +842,8 @@ components:
         plateNumber:
           type: [string, 'null']
         ownerName:
+          type: [string, 'null']
+        carDetails:
           type: [string, 'null']
         direction:
           type: string

@@ -11,7 +11,7 @@ import {
   SendEspHeartbeatBody,
 } from "@workspace/api-zod";
 import { broadcast } from "../lib/ws";
-
+import { getLiveDevices, sendDeviceCommand } from "../deviceRegistry";
 
 const router: IRouter = Router();
 
@@ -140,6 +140,35 @@ router.post("/esp-devices/:id/heartbeat", async (req, res): Promise<void> => {
   res.json(device);
 });
 
+// Live Device Telemetry & Connected Devices endpoint
+router.get("/devices/live", async (_req, res): Promise<void> => {
+  const live = getLiveDevices();
+  res.json(live);
+});
 
+// Send remote command to a connected ESP32 device
+router.post("/devices/:id/command", async (req, res): Promise<void> => {
+  const targetId = req.params.id;
+  const payload = req.body || {};
+
+  if (!payload.cmd && !payload.type) {
+    res.status(400).json({ error: "Command payload must include 'cmd' or 'type'" });
+    return;
+  }
+
+  const packet = {
+    type: payload.type || "cmd",
+    cmd: payload.cmd,
+    ...payload,
+  };
+
+  const result = sendDeviceCommand(targetId, packet);
+  if (!result.success) {
+    res.status(404).json(result);
+    return;
+  }
+
+  res.json(result);
+});
 
 export default router;

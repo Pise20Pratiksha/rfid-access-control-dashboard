@@ -16,52 +16,7 @@ const DEVICE_NAME = "ESP32 Gate Logger";
 
 let esp32Socket: net.Socket | null = null;
 
-// Interface name patterns that indicate virtual adapters (VPN, Hyper-V,
-// VMware/VirtualBox, WSL, Docker) rather than a real WiFi/Ethernet NIC.
-const VIRTUAL_IFACE_PATTERNS = [
-  /vEthernet/i, /Virtual/i, /VMware/i, /VirtualBox/i,
-  /Hyper-V/i, /WSL/i, /Docker/i, /Loopback/i, /Tailscale/i,
-  /ZeroTier/i, /TAP/i, /TUN/i,
-];
-
-// Private-LAN ranges typical home/office routers hand out.
-// Prefer these over anything else (e.g. 172.16-31.x.x used by
-// virtual switches is deliberately NOT prioritized here).
-function isLikelyRealLan(address: string): boolean {
-  return address.startsWith("192.168.") || address.startsWith("10.");
-}
-
-export function getLocalIpAddress(): string {
-  const interfaces = os.networkInterfaces();
-  const candidates: { name: string; address: string }[] = [];
-
-  for (const name of Object.keys(interfaces)) {
-    const interfaceList = interfaces[name];
-    if (!interfaceList) continue;
-    for (const netInterface of interfaceList) {
-      if (netInterface.family === "IPv4" && !netInterface.internal) {
-        candidates.push({ name, address: netInterface.address });
-      }
-    }
-  }
-
-  // 1. Prefer a real-looking LAN IP on a non-virtual adapter
-  const best = candidates.find(
-    (c) => isLikelyRealLan(c.address) && !VIRTUAL_IFACE_PATTERNS.some((p) => p.test(c.name))
-  );
-  if (best) return best.address;
-
-  // 2. Fall back to any non-virtual adapter
-  const fallback = candidates.find(
-    (c) => !VIRTUAL_IFACE_PATTERNS.some((p) => p.test(c.name))
-  );
-  if (fallback) return fallback.address;
-
-  // 3. Last resort: whatever was found first
-  if (candidates.length > 0) return candidates[0].address;
-
-  return "127.0.0.1";
-}
+export { getLocalIpAddress, getAllLocalIpv4Addresses, isLocalAddress } from "./networkUtils";
 
 function parseESP32DateTime(dateStr: string, timeStr: string): Date | null {
   try {
@@ -159,6 +114,7 @@ async function processRecord(
     .where(eq(rfidCardsTable.cardUid, epc))
     .limit(1);
 
+  const isRegistered = Boolean(card);
   const authorized = Boolean(card?.active);
 
   const [inserted] = await db
@@ -180,6 +136,7 @@ async function processRecord(
       vehicleId: accessLogsTable.vehicleId,
       plateNumber: vehiclesTable.plateNumber,
       ownerName: vehiclesTable.ownerName,
+      carDetails: vehiclesTable.carDetails,
       direction: accessLogsTable.direction,
       authorized: accessLogsTable.authorized,
       deviceId: accessLogsTable.deviceId,
@@ -192,7 +149,25 @@ async function processRecord(
     .where(eq(accessLogsTable.id, inserted.id))
     .limit(1);
 
-  if (enriched) broadcast("access_log_created", enriched);
+  if (enriched) {
+    const payload = {
+      ...enriched,
+      isRegistered,
+    };
+    broadcast("access_log_created", payload);
+    broadcast("tag_detected", {
+      cardUid: epc,
+      isRegistered,
+      authorized,
+      direction: dir,
+      deviceId,
+      deviceName: enriched.deviceName || DEVICE_NAME,
+      plateNumber: enriched.plateNumber,
+      ownerName: enriched.ownerName,
+      carDetails: enriched.carDetails,
+      timestamp: timestamp.toISOString(),
+    });
+  }
   return true;
 }
 
@@ -202,73 +177,7 @@ function sendToESP32(obj: Record<string, unknown>) {
   }
 }
 
-export function initESP32ConnectionService() {
-  const server = net.createServer((socket) => {
-    const remoteIp = socket.remoteAddress?.replace("::ffff:", "") ?? "unknown";
-    logger.info(`ESP32 Gate Logger connected from ${remoteIp}`);
-    esp32Socket = socket;
-
-    let buffer = "";
-
-    socket.on("data", async (data) => {
-      buffer += data.toString("utf8");
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-
-        try {
-          const payload = JSON.parse(trimmed);
-
-          if (payload.type === "status" && payload.status === "online") {
-            const ip = payload.ip || remoteIp;
-            logger.info(`ESP32 Gate Logger reports online at IP: ${ip}`);
-            await getOrCreateESP32Device(ip);
-            logger.info("Requesting historical log dump...");
-            sendToESP32({ type: "cmd", cmd: "dump" });
-          } else if (payload.type === "detection") {
-            const deviceId = await getOrCreateESP32Device(remoteIp);
-            await processRecord(payload, deviceId);
-          } else if (payload.type === "sync_response" && Array.isArray(payload.records)) {
-            const deviceId = await getOrCreateESP32Device(remoteIp);
-            logger.info(`Fetched ${payload.records.length} historical logs. Processing...`);
-            let newLogsInserted = 0;
-            for (const record of payload.records) {
-              const isNew = await processRecord(record, deviceId);
-              if (isNew) newLogsInserted++;
-            }
-            logger.info(`Logs synchronization finished. Added ${newLogsInserted} new logs.`);
-            if (payload.records.length > 0) {
-              logger.info("Requesting ESP32 to clear its local records...");
-              sendToESP32({ type: "cmd", cmd: "clear" });
-            }
-          }
-        } catch (err: any) {
-          logger.error({ err: err.message, line: trimmed }, "Error processing ESP32 TCP message");
-        }
-      }
-    });
-
-    socket.on("error", (err) => {
-      logger.warn(`ESP32 TCP socket error: ${err.message}`);
-    });
-
-    socket.on("close", async () => {
-      logger.warn("ESP32 Gate Logger disconnected");
-      if (esp32Socket === socket) esp32Socket = null;
-      await updateDeviceStatus("offline");
-    });
-  });
-
-  server.listen(TCP_PORT, "0.0.0.0", () => {
-    const lanIP = getLocalIpAddress();
-    logger.info(`ESP32 TCP server listening on port ${TCP_PORT}. LAN IP: ${lanIP}`);
-    logger.info(`Point the firmware's DESKTOP_HOST at: ${lanIP}`);
-  });
-
-  server.on("error", (err) => {
-    logger.error({ err }, "ESP32 TCP server error");
-  });
+export function initESP32ConnectionService(): void {
+  // Delegated to unified bidirectional TCP server
+  logger.info("[ESP32 Service] Initializing unified ESP32 TCP server on port " + TCP_PORT);
 }

@@ -1,6 +1,7 @@
 import { Link, useLocation } from "wouter";
 import { useAuth } from "@workspace/replit-auth-web";
 import { useLiveSocket } from "@/hooks/use-live-socket";
+import { useFirmwareConnected } from "@/hooks/use-firmware-connected";
 import {
   Activity,
   Car,
@@ -9,8 +10,6 @@ import {
   LayoutDashboard,
   LogOut,
   Menu,
-  Signal,
-  WifiOff,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -27,10 +26,12 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { Badge } from "@/components/ui/badge";
+import { UnregisteredTagPopup } from "@/components/unregistered-tag-popup";
 
 export function AppLayout({ children }: { children: React.ReactNode }) {
   const { user, logout } = useAuth();
-  const { status: socketStatus } = useLiveSocket();
+  useLiveSocket();
+  const firmwareConnected = useFirmwareConnected();
   const [location] = useLocation();
 
   return (
@@ -38,9 +39,14 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
       <div className="flex min-h-screen w-full bg-background">
         <Sidebar className="border-r border-border bg-card">
           <SidebarHeader className="border-b border-border p-4">
-            <div className="flex items-center gap-2 font-mono text-xl font-bold tracking-tight text-primary">
-              <Cpu className="h-6 w-6" />
-              <span>RFID SCAN</span>
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-blue-600 to-sky-400 text-white shadow-lg shadow-blue-500/30">
+                <Cpu className="h-5 w-5" />
+              </div>
+              <div className="leading-tight">
+                <div className="text-base font-bold tracking-tight text-foreground">RFID Access</div>
+                <div className="text-[11px] text-muted-foreground">Gate Control</div>
+              </div>
             </div>
           </SidebarHeader>
           <SidebarContent>
@@ -129,37 +135,31 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
         </Sidebar>
 
         <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
-          <header className="h-14 border-b border-border bg-card/50 flex items-center justify-between px-4 sticky top-0 z-10 backdrop-blur-sm">
+          <header className="h-14 border-b border-border/60 bg-white/70 flex items-center justify-between px-4 sticky top-0 z-10 backdrop-blur-md">
             <div className="flex items-center gap-4">
               <SidebarTrigger />
-              <h1 className="text-sm font-mono text-muted-foreground uppercase tracking-widest hidden sm:block">
-                {location === "/" ? "SYSTEM OVERVIEW" : location.replace("/", "").replace("-", " ")}
+              <h1 className="text-sm font-semibold text-foreground/70 capitalize tracking-wide hidden sm:block">
+                {location === "/" ? "System overview" : location.replace("/", "").replace("-", " ")}
               </h1>
             </div>
-            <div className="flex items-center gap-4">
-              {socketStatus === "connected" && (
+            <div className="flex items-center gap-3">
+              {firmwareConnected && (
                 <Badge variant="outline" className="border-success/50 text-success bg-success/10 font-mono gap-1.5" data-testid="status-socket">
-                  <Signal className="h-3 w-3" />
+                  <span className="relative flex h-2 w-2">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-75" />
+                    <span className="relative inline-flex h-2 w-2 rounded-full bg-success" />
+                  </span>
                   LIVE
-                </Badge>
-              )}
-              {socketStatus === "connecting" && (
-                <Badge variant="outline" className="border-warning/50 text-warning bg-warning/10 font-mono gap-1.5" data-testid="status-socket">
-                  <Signal className="h-3 w-3 animate-pulse" />
-                  CONNECTING
-                </Badge>
-              )}
-              {(socketStatus === "disconnected" || socketStatus === "reconnecting") && (
-                <Badge variant="outline" className="border-destructive/50 text-destructive bg-destructive/10 font-mono gap-1.5" data-testid="status-socket">
-                  <WifiOff className="h-3 w-3" />
-                  OFFLINE
                 </Badge>
               )}
             </div>
           </header>
           <div className="flex-1 overflow-auto p-4 sm:p-6 lg:p-8">
-            {children}
+            <div key={location} className="animate-rise">
+              {children}
+            </div>
           </div>
+          <UnregisteredTagPopup />
         </main>
       </div>
     </SidebarProvider>

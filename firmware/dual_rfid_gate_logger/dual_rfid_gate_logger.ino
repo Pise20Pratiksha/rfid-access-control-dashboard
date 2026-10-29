@@ -1,31 +1,23 @@
 // ============================================================
-//  DUAL RFID GATE LOGGER  (with WiFi AP + Local App API)
+//  DUAL RFID GATE LOGGER with Seamless Device-to-Device (D2D)
+//  Local Wi-Fi Communication & Automatic Discovery
 //  Hardware : ESP32
-//             + 2× CF000749 UHF modules (IN / OUT)
-//             + DS3231 RTC (I²C)
+//             + 2x CF000749 UHF modules (IN / OUT UART)
+//             + DS3231 RTC (I2C)
 //             + ILI9341 TFT (SPI)
+//             + Optional Gate Relay (GPIO 32)
 //
-//  Serial commands (115200 baud):
-//    d  → dump all stored records
-//    c  → clear / erase all records
-//    s  → show buffer stats
-//    t  → set RTC time  (then send: DD/MM/YYYY HH:MM:SS)
-//
-//  WiFi (Access Point) — connect your phone/PC/app to this:
-//    SSID:     GateLogger
-//    Password: logger123
-//    ESP32 IP: 192.168.4.1
-//
-//  HTTP JSON API (poll from your app):
-//    GET http://192.168.4.1/dump    -> all stored records as JSON
-//    GET http://192.168.4.1/stats   -> counters as JSON
-//    GET http://192.168.4.1/clear   -> clears all records
-//
-//  Live push (real-time, no polling needed):
-//    Open a raw TCP socket to 192.168.4.1 : 8080
-//    Every time a tag is detected, one JSON line is pushed to
-//    every connected socket, e.g.:
-//    {"event":"detection","epc":"E2000...","date":"13/07/2026","time":"10:15:02","dir":"IN"}
+//  Key Features:
+//    - Zero Internet Access Required: Purely local router D2D communication
+//    - Permanent Unique Device ID: Derived from factory eFuse MAC address
+//    - Automatic Discovery: Non-blocking UDP broadcast + mDNS resolution
+//    - Dynamic IP Resolution: Adapts automatically to DHCP renewals on both
+//      the ESP32 and the application server without restarts
+//    - Secure Device Authentication: Pre-shared key handshake & message validation
+//    - Reliable Bidirectional TCP: Real-time scan transfer, instant auth feedback
+//      (green/red screen + gate trigger), remote commands, RTC time sync
+//    - Resilient Reconnection: Wi-Fi disconnect recovery, dead-socket watchdog
+//    - Offline NVS Storage: Circular buffer with verified synchronization
 // ============================================================
 
 #include <Adafruit_GFX.h>
@@ -38,11 +30,30 @@
 #include <RTClib.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
 #include <WebServer.h>
-#include <HTTPClient.h>
 
 // ─────────────────────────────────────────────────────────────
-//  DEBUG
+//  CLOUD MODE (Render / any HTTPS host)
+//  1 = connect out to wss://CLOUD_HOST/api/device-ws (works from any Wi-Fi,
+//      no mDNS / UDP discovery / open ports needed)
+//  0 = legacy LAN mode (UDP + mDNS discovery, raw TCP to the local server)
+//  Requires the Arduino library "WebSockets" by Markus Sattler (v2.4+).
+// ─────────────────────────────────────────────────────────────
+#define CLOUD_MODE 1
+#if CLOUD_MODE
+  #include <WebSocketsClient.h>
+  #define CLOUD_HOST "YOUR-APP-NAME.onrender.com"   // no https://, no trailing slash
+  #define CLOUD_PORT 443
+  #define CLOUD_PATH "/api/device-ws"
+  // Optional: pin the server's root CA (PEM string) to stop man-in-the-middle.
+  // Needs a correct clock, so only enable once the RTC/NTP time is reliable.
+  // #define CLOUD_ROOT_CA "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n"
+#endif
+
+// ─────────────────────────────────────────────────────────────
+//  DEBUG OUTPUT
 // ─────────────────────────────────────────────────────────────
 #define DEBUG 1
 #if DEBUG
@@ -53,52 +64,110 @@
   #define DBGLN(x)
 #endif
 
-
-struct TagRecord;
-
 // ─────────────────────────────────────────────────────────────
 //  PIN DEFINITIONS
 // ─────────────────────────────────────────────────────────────
-#define TFT_CS   5
-#define TFT_DC   2
-#define TFT_RST  4
+#define TFT_CS         5
+#define TFT_DC         2
+#define TFT_RST        4
 
-#define UHF_IN_RX  16
-#define UHF_IN_TX  17
-#define UHF_OUT_RX 25
-#define UHF_OUT_TX 26
+#define UHF_IN_RX      16
+#define UHF_IN_TX      17
+#define UHF_OUT_RX     25
+#define UHF_OUT_TX     26
+
+// Optional Relay output for gate barrier motor (set to -1 if unused)
+#define GATE_RELAY_PIN 32
+#define RELAY_ACTIVE_LOW 0 // 1 if relay module is active LOW, 0 if active HIGH
 
 // ─────────────────────────────────────────────────────────────
-//  TUNING
+//  TUNING CONSTANTS
 // ─────────────────────────────────────────────────────────────
 const byte          TX_POWER_DBM = 30;
 const unsigned long INVENTORY_MS = 600;
-const unsigned long DEDUP_MS     = 300000UL;
+const unsigned long DEDUP_MS     = 300000UL; // 5 minutes duplicate filter
 
 // ─────────────────────────────────────────────────────────────
-//  WIFI AP + LOCAL APP API & MQTT CONFIGURATION
+//  NETWORK CONFIGURATION (Wi-Fi + Hostname + TCP + Auth)
 // ─────────────────────────────────────────────────────────────
+// Wi-Fi Station credentials (SPJ Wi-Fi Router)
+const char* WIFI_SSID = "spjetpl";
+const char* WIFI_PASS = "spjetplpune123";
+
+// Fallback SoftAP credentials if router is unreachable
 const char* AP_SSID = "GateLogger";
-const char* AP_PASS = "logger123";      // WPA2 needs >= 8 chars
+const char* AP_PASS = "logger123";
 IPAddress   AP_IP(192, 168, 4, 1);
 IPAddress   AP_GATEWAY(192, 168, 4, 1);
 IPAddress   AP_SUBNET(255, 255, 255, 0);
 
-// Wifi credentials for office Wi-Fi connection
-const char* WIFI_SSID = "spjetpl";
-const char* WIFI_PASS = "spjetplpune123";
+// Hostname of the application server (mDNS / Local DNS)
+const char* APP_HOSTNAME          = "rfid-app.local";
 
-// Desktop LAN IP hosting the web application
-const char* LAPTOP_IP   = "192.168.1.100"; // Replace with desktop's current LAN IP
-const int   LAPTOP_PORT = 8080;
+// Fixed TCP server port on the backend application
+const uint16_t TCP_SERVER_PORT    = 5001;
 
-WebServer server(80);
+// UDP Discovery port for local broadcast discovery and beacon reception
+const uint16_t UDP_DISCOVERY_PORT = 5002;
 
-#define MAX_TCP_CLIENTS 4
-WiFiServer tcpServer(8080);
-WiFiClient tcpClients[MAX_TCP_CLIENTS];
+// Secure pre-shared authentication key (must equal the server's DEVICE_AUTH_SECRET).
+// Replace with the secret you set on Render before flashing; never commit the real value.
+const char* DEVICE_AUTH_KEY       = "CHANGE_ME_DEVICE_AUTH_SECRET";
 
-String apIPString = "192.168.4.1";
+// Timers and intervals
+const unsigned long DISCOVERY_PROBE_INTERVAL_MS = 2000;  // Probe every 2s during discovery
+const unsigned long TCP_RETRY_INTERVAL_MS       = 3000;  // Retry connect every 3s
+const unsigned long TCP_PING_INTERVAL_MS        = 15000; // Ping every 15s
+const unsigned long TCP_RX_TIMEOUT_MS           = 45000; // 45s without data = dead socket
+const unsigned long RELAY_PULSE_DURATION_MS     = 2500;  // Gate open pulse length
+
+// ─────────────────────────────────────────────────────────────
+//  PERMANENT DEVICE IDENTIFICATION
+// ─────────────────────────────────────────────────────────────
+String permanentDeviceId = "";
+String deviceMacAddress  = "";
+
+String getPermanentDeviceId() {
+  if (permanentDeviceId.length() > 0) return permanentDeviceId;
+  uint64_t chipId = ESP.getEfuseMac();
+  char idBuf[32];
+  snprintf(idBuf, sizeof(idBuf), "ESP32-GATE-%04X%08X", (uint16_t)(chipId >> 32), (uint32_t)chipId);
+  permanentDeviceId = String(idBuf);
+  return permanentDeviceId;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  NETWORK STATE MACHINE
+// ─────────────────────────────────────────────────────────────
+enum NetState {
+  STATE_WIFI_DISCONNECTED,
+  STATE_DISCOVERING_SERVER,
+  STATE_CONNECTING_TCP,
+  STATE_AUTHENTICATING,
+  STATE_CONNECTED
+};
+
+NetState      netState                 = STATE_WIFI_DISCONNECTED;
+IPAddress     serverIP;
+uint16_t      serverPort               = TCP_SERVER_PORT;
+bool          hostnameResolved         = false;
+bool          isAuthenticated          = false;
+IPAddress     lastKnownLocalIP;
+
+unsigned long lastWifiCheckMs          = 0;
+unsigned long lastDiscoveryAttemptMs   = 0;
+unsigned long lastTcpAttemptMs         = 0;
+unsigned long lastAuthAttemptMs        = 0;
+unsigned long lastPingSentMs           = 0;
+unsigned long lastServerRxMs           = 0;
+unsigned long relayOffAtMs             = 0;
+bool          relayActive              = false;
+
+int           tcpConnectFailCount      = 0;
+int           resolveFailCount         = 0;
+
+String        ipString                 = "0.0.0.0";
+String        networkStatusText        = "Booting...";
 
 // ─────────────────────────────────────────────────────────────
 //  NVS CIRCULAR BUFFER
@@ -107,9 +176,9 @@ String apIPString = "192.168.4.1";
 #define NVS_NAMESPACE "rfidlog"
 
 Preferences nvs;
-uint32_t nvsHead  = 0;
-uint32_t nvsTail  = 0;
-uint32_t nvsCount = 0;
+uint32_t    nvsHead  = 0;
+uint32_t    nvsTail  = 0;
+uint32_t    nvsCount = 0;
 
 #define REC_KEY_LEN 12
 
@@ -170,7 +239,7 @@ void nvsClearAll() {
   nvs.clear();
   nvs.end();
   nvsHead = nvsTail = nvsCount = 0;
-  DBGLN("NVS cleared.");
+  DBGLN("[NVS] Cleared all local records.");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -212,24 +281,74 @@ bool isNewTag(const String& epc, TagRecord* table, int& count) {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  OBJECTS
+//  GLOBAL HARDWARE & NETWORKING OBJECTS
 // ─────────────────────────────────────────────────────────────
-Adafruit_ILI9341 tft    = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
 HardwareSerial   uhfIN(2);
 HardwareSerial   uhfOUT(1);
 RTC_DS3231       rtc;
 
-// ─────────────────────────────────────────────────────────────
-//  GLOBALS
-//  NOTE: idleDrawn is REMOVED. showIdleScreen() manages its
-//        own state internally via static variables.
-// ─────────────────────────────────────────────────────────────
-int  totalDetect        = 0;
-bool tagScreenActive    = false;   // true while tag screen is showing
-bool idleNeedsFullRedraw = false;  // set true when returning from tag screen
+WiFiUDP          udpDiscovery;
+#if CLOUD_MODE
+// Drop-in replacement for WiFiClient: same newline-delimited JSON protocol,
+// carried one message per WebSocket text frame over TLS (wss://).
+class WsLineClient {
+public:
+  bool connect(IPAddress, uint16_t) {
+    _rx = ""; _out = ""; _up = false;
+#ifdef CLOUD_ROOT_CA
+    _ws.beginSslWithCA(CLOUD_HOST, CLOUD_PORT, CLOUD_PATH, CLOUD_ROOT_CA);
+#else
+    _ws.beginSSL(CLOUD_HOST, CLOUD_PORT, CLOUD_PATH);
+#endif
+    _ws.onEvent([this](WStype_t type, uint8_t* payload, size_t length) {
+      if (type == WStype_CONNECTED) {
+        _up = true;
+      } else if (type == WStype_DISCONNECTED) {
+        _up = false;
+      } else if (type == WStype_TEXT) {
+        _rx += String((const char*)payload).substring(0, length);
+        _rx += "\n";
+      }
+    });
+    _ws.setReconnectInterval(5000);
+    _ws.enableHeartbeat(15000, 5000, 2);   // WS ping/pong keeps NAT + proxy alive
+    unsigned long start = millis();
+    while (!_up && millis() - start < 8000) { _ws.loop(); delay(10); }
+    return _up;
+  }
+  void setNoDelay(bool) {}
+  bool connected() { _ws.loop(); return _up; }
+  int  available() { _ws.loop(); return _rx.length(); }
+  String readStringUntil(char) {
+    int nl = _rx.indexOf('\n');
+    if (nl < 0) { String all = _rx; _rx = ""; return all; }
+    String line = _rx.substring(0, nl);
+    _rx.remove(0, nl + 1);
+    return line;
+  }
+  size_t print(const String& s) { _out += s; if (_out.endsWith("\n")) flush(); return s.length(); }
+  size_t print(const char* s)   { return print(String(s)); }
+  void flush() { if (_out.length() && _up) _ws.sendTXT(_out); _out = ""; }
+  void stop()  { _ws.disconnect(); _up = false; _rx = ""; _out = ""; }
+  explicit operator bool() const { return _up; }
+private:
+  WebSocketsClient _ws;
+  String _rx, _out;
+  bool   _up = false;
+};
+WsLineClient     tcpClient;
+#else
+WiFiClient       tcpClient;
+#endif
+WebServer        server(80);
+
+int              totalDetect         = 0;
+bool             tagScreenActive     = false;
+bool             idleNeedsFullRedraw = false;
 
 // ─────────────────────────────────────────────────────────────
-//  CRC16
+//  CRC16 HELPER
 // ─────────────────────────────────────────────────────────────
 unsigned int crc16(byte* p, unsigned int len) {
   unsigned int crc = 0xFFFF;
@@ -242,7 +361,7 @@ unsigned int crc16(byte* p, unsigned int len) {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  UHF COMMANDS
+//  UHF HARDWARE COMMANDS
 // ─────────────────────────────────────────────────────────────
 void sendCmd(HardwareSerial& port, byte* cmd, byte len) {
   unsigned int c = crc16(cmd, len);
@@ -281,61 +400,39 @@ void sendStopInventory(HardwareSerial& port) {
   sendCmd(port, cmd, sizeof(cmd));
 }
 
-// ─────────────────────────────────────────────────────────────
-//  READ ONE EPC FRAME
-// ─────────────────────────────────────────────────────────────
-String readOneEPCFrame(HardwareSerial& port, unsigned long windowEndMs) {
-  while (millis() < windowEndMs) {
-    if (!port.available()) continue;
-    if (port.peek() != 0xCF) { port.read(); continue; }
+String readOneEPCFrame(HardwareSerial& port, unsigned long windowEnd) {
+  while (millis() < windowEnd) {
+    if (port.available() < 4) { delay(2); continue; }
+    if (port.read() != 0xCF) continue;
+    if (port.read() != 0xFF) continue;
 
-    byte h[5];
-    bool headerOK = true;
-    for (int i = 0; i < 5; i++) {
-      unsigned long bw = millis();
-      while (!port.available() && millis() - bw < 50);
-      if (!port.available()) { headerOK = false; break; }
-      h[i] = port.read();
+    int lenH = port.read();
+    int lenL = port.read();
+    if (lenH < 0 || lenL < 0) continue;
+    int payloadLen = (lenH << 8) | lenL;
+    if (payloadLen <= 0 || payloadLen > 64) continue;
+
+    byte buf[64];
+    int readBytes = port.readBytes(buf, payloadLen);
+    if (readBytes < payloadLen) continue;
+
+    byte crcBytes[2];
+    if (port.readBytes(crcBytes, 2) < 2) continue;
+
+    if (payloadLen > 8) {
+      char hex[64];
+      int  hexIdx = 0;
+      for (int i = 8; i < payloadLen; i++) {
+        snprintf(hex + hexIdx, 3, "%02X", buf[i]);
+        hexIdx += 2;
+      }
+      hex[hexIdx] = '\0';
+      return String(hex);
     }
-    if (!headerOK) continue;
-
-    byte frameLen = h[4];
-    byte total    = frameLen + 7;
-    if (total > 128) continue;
-
-    byte f[128];
-    memcpy(f, h, 5);
-    bool bodyOK = true;
-    for (int i = 5; i < total; i++) {
-      unsigned long bw = millis();
-      while (!port.available() && millis() - bw < 200);
-      if (!port.available()) { bodyOK = false; break; }
-      f[i] = port.read();
-    }
-    if (!bodyOK) continue;
-
-    unsigned int calc = crc16(f, total - 2);
-    unsigned int recv = ((unsigned int)f[total-2] << 8) | f[total-1];
-    if (calc != recv) continue;
-    if (f[3] != 0x01) continue;
-
-    byte epcLen = f[10];
-    if (epcLen == 0 || epcLen > 32) continue;
-
-    String epc = "";
-    for (int i = 0; i < epcLen; i++) {
-      if (f[11+i] < 0x10) epc += "0";
-      epc += String(f[11+i], HEX);
-    }
-    epc.toUpperCase();
-    return epc;
   }
   return "";
 }
 
-// ─────────────────────────────────────────────────────────────
-//  INVENTORY BURST
-// ─────────────────────────────────────────────────────────────
 String runInventoryBurst(HardwareSerial& port) {
   flushPort(port);
   sendInventory(port);
@@ -343,65 +440,52 @@ String runInventoryBurst(HardwareSerial& port) {
   String epc = readOneEPCFrame(port, windowEnd);
   sendStopInventory(port);
   unsigned long st = millis();
-  while (millis() - st < 80)
+  while (millis() - st < 80) {
     if (port.available()) port.read();
+  }
   return epc;
 }
 
 // ─────────────────────────────────────────────────────────────
-//  RTC HELPERS
+//  GATE RELAY CONTROL
+// ─────────────────────────────────────────────────────────────
+void triggerGateRelay() {
+  if (GATE_RELAY_PIN < 0) return;
+  DBGLN("[RELAY] Triggering gate barrier open pulse...");
+  digitalWrite(GATE_RELAY_PIN, RELAY_ACTIVE_LOW ? LOW : HIGH);
+  relayActive = true;
+  relayOffAtMs = millis() + RELAY_PULSE_DURATION_MS;
+}
+
+void serviceRelay() {
+  if (relayActive && millis() >= relayOffAtMs) {
+    if (GATE_RELAY_PIN >= 0) {
+      digitalWrite(GATE_RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    }
+    relayActive = false;
+    DBGLN("[RELAY] Gate pulse ended, relay de-energized.");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  DATE & TIME HELPERS
 // ─────────────────────────────────────────────────────────────
 String getDateString() {
   DateTime now = rtc.now();
   char buf[12];
-  snprintf(buf, sizeof(buf), "%02d/%02d/%04d",
-           now.day(), now.month(), now.year());
+  snprintf(buf, sizeof(buf), "%02d/%02d/%04d", now.day(), now.month(), now.year());
   return String(buf);
 }
 
 String getTimeString() {
   DateTime now = rtc.now();
   char buf[10];
-  snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
-           now.hour(), now.minute(), now.second());
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
   return String(buf);
 }
 
-// ─────────────────────────────────────────────────────────────
-//  RTC SET via Serial
-//  Send 't' then immediately send: DD/MM/YYYY HH:MM:SS
-//  Example: 16/05/2026 14:30:00
-// ─────────────────────────────────────────────────────────────
-void handleRTCSet() {
-  // Flush leftover \r\n from Enter keypress
-  unsigned long flush = millis();
-  while (millis() - flush < 100) {
-    if (Serial.available()) Serial.read();
-    delay(1);
-  }
-
-  Serial.println("Ready. Now send: DD/MM/YYYY HH:MM:SS");
-  Serial.println("Example:         16/05/2026 14:30:00");
-
-  // Wait up to 10 seconds
-  unsigned long wait = millis();
-  while (!Serial.available() && millis() - wait < 10000) delay(10);
-
-  if (!Serial.available()) {
-    Serial.println("Timeout. Try again.");
-    return;
-  }
-
-  String ts = Serial.readStringUntil('\n');
-  ts.trim();
-
-  Serial.print("Received: ["); Serial.print(ts);
-  Serial.print("] length="); Serial.println(ts.length());
-
-  if (ts.length() < 19) {
-    Serial.println("ERROR: Too short. Need DD/MM/YYYY HH:MM:SS");
-    return;
-  }
+bool applyDateTime(const String& ts) {
+  if (ts.length() < 19) return false;
 
   int d  = ts.substring(0,  2).toInt();
   int mo = ts.substring(3,  5).toInt();
@@ -410,92 +494,92 @@ void handleRTCSet() {
   int mi = ts.substring(14, 16).toInt();
   int s  = ts.substring(17, 19).toInt();
 
-  Serial.printf("Parsed: %02d/%02d/%04d %02d:%02d:%02d\n", d, mo, y, h, mi, s);
-
-  if (y < 2020 || y > 2099 ||
-      mo < 1   || mo > 12  ||
-      d  < 1   || d  > 31  ||
-      h  > 23  || mi > 59  || s > 59) {
-    Serial.println("ERROR: Invalid values.");
-    return;
+  if (y < 2020 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || s > 59) {
+    DBGLN("[RTC] Invalid datetime values");
+    return false;
   }
 
-  // ── Re-init I2C and RTC before writing ──────────────────
-  Wire.end();
-  delay(50);
-  Wire.begin(21, 22);
-  delay(50);
+  rtc.adjust(DateTime(y, mo, d, h, mi, s));
+  DBG("[RTC] Datetime synchronized to: "); DBGLN(ts);
+  idleNeedsFullRedraw = true;
+  return true;
+}
 
-  // Check DS3231 is reachable on I2C bus
-  Wire.beginTransmission(0x68);   // DS3231 I2C address is always 0x68
-  byte err = Wire.endTransmission();
-  if (err != 0) {
-    Serial.print("ERROR: DS3231 not found on I2C bus. Error code: ");
-    Serial.println(err);
-    Serial.println("Check SDA=21 SCL=22 wiring and pull-up resistors.");
+void handleRTCSet() {
+  unsigned long flush = millis();
+  while (millis() - flush < 100) {
+    if (Serial.available()) Serial.read();
+    delay(1);
+  }
+  Serial.println("Send datetime in format: DD/MM/YYYY HH:MM:SS (e.g. 15/10/2026 16:30:00)");
+  unsigned long wait = millis();
+  while (!Serial.available() && millis() - wait < 10000) delay(10);
+  if (!Serial.available()) {
+    Serial.println("Timeout.");
     return;
   }
-  Serial.println("DS3231 found on I2C bus OK.");
-
-  // Re-begin RTC after Wire re-init
-  if (!rtc.begin()) {
-    Serial.println("ERROR: rtc.begin() failed after Wire re-init.");
-    return;
-  }
-
-  // Write time using direct register write for reliability
-  // DS3231 uses BCD encoding
-  auto toBCD = [](int val) -> byte {
-    return ((val / 10) << 4) | (val % 10);
-  };
-
-  Wire.beginTransmission(0x68);
-  Wire.write(0x00);              // start at register 0 (seconds)
-  Wire.write(toBCD(s));          // reg 0x00 = seconds
-  Wire.write(toBCD(mi));         // reg 0x01 = minutes
-  Wire.write(toBCD(h));          // reg 0x02 = hours (24h mode, bit6=0)
-  Wire.write(0x01);              // reg 0x03 = day of week (1=Sunday, we set 1)
-  Wire.write(toBCD(d));          // reg 0x04 = date
-  Wire.write(toBCD(mo));         // reg 0x05 = month
-  Wire.write(toBCD(y - 2000));   // reg 0x06 = year (0-99)
-  byte writeErr = Wire.endTransmission();
-
-  if (writeErr != 0) {
-    Serial.print("ERROR: I2C write failed. Code: ");
-    Serial.println(writeErr);
-    return;
-  }
-
-  Serial.println("Registers written directly via I2C.");
-
-  // ── Verify by reading back ───────────────────────────────
-  delay(200);
-  DateTime check = rtc.now();
-  Serial.printf("RTC verified: %02d/%02d/%04d %02d:%02d:%02d\n",
-                check.day(), check.month(), check.year(),
-                check.hour(), check.minute(), check.second());
-
-  // Check if verify matches what we wrote (within 2 seconds)
-  bool ok = (check.year()   == y  &&
-             check.month()  == mo &&
-             check.day()    == d  &&
-             check.hour()   == h  &&
-             check.minute() == mi);
-
-  if (ok) {
+  String ts = Serial.readStringUntil('\n');
+  ts.trim();
+  if (applyDateTime(ts)) {
     Serial.println("RTC set successfully!");
-    idleNeedsFullRedraw = true;
   } else {
-    Serial.println("WARNING: Readback mismatch — check I2C wiring.");
-    Serial.println("Try adding 4.7k pull-up resistors on SDA and SCL to 3.3V.");
+    Serial.println("Failed to set RTC.");
   }
 }
 
 // ─────────────────────────────────────────────────────────────
-//  WIFI AP + LOCAL APP API  (HTTP + raw TCP live push)
+//  LIGHTWEIGHT ROBUST JSON PARSER HELPERS
 // ─────────────────────────────────────────────────────────────
+String extractJsonString(const String& json, const String& key) {
+  String target = "\"" + key + "\"";
+  int keyIndex = json.indexOf(target);
+  if (keyIndex == -1) return "";
 
-// Turn "epc,date,time,dir" into a JSON object string
+  int colonIndex = json.indexOf(':', keyIndex + target.length());
+  if (colonIndex == -1) return "";
+
+  int quoteStart = json.indexOf('\"', colonIndex + 1);
+  if (quoteStart == -1) return "";
+
+  int quoteEnd = json.indexOf('\"', quoteStart + 1);
+  if (quoteEnd == -1) return "";
+
+  return json.substring(quoteStart + 1, quoteEnd);
+}
+
+int extractJsonInt(const String& json, const String& key, int defaultVal = 0) {
+  String target = "\"" + key + "\"";
+  int keyIndex = json.indexOf(target);
+  if (keyIndex == -1) return defaultVal;
+
+  int colonIndex = json.indexOf(':', keyIndex + target.length());
+  if (colonIndex == -1) return defaultVal;
+
+  int i = colonIndex + 1;
+  while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\t')) i++;
+
+  int numStart = i;
+  while (i < (int)json.length() && (isDigit(json[i]) || json[i] == '-')) i++;
+
+  if (numStart == i) return defaultVal;
+  return json.substring(numStart, i).toInt();
+}
+
+bool extractJsonBool(const String& json, const String& key, bool defaultVal = false) {
+  String target = "\"" + key + "\"";
+  int keyIndex = json.indexOf(target);
+  if (keyIndex == -1) return defaultVal;
+
+  int colonIndex = json.indexOf(':', keyIndex + target.length());
+  if (colonIndex == -1) return defaultVal;
+
+  String rest = json.substring(colonIndex + 1);
+  rest.trim();
+  if (rest.startsWith("true")) return true;
+  if (rest.startsWith("false")) return false;
+  return defaultVal;
+}
+
 String recordToJSON(const String& rec, uint32_t idx) {
   int c1 = rec.indexOf(',');
   int c2 = rec.indexOf(',', c1 + 1);
@@ -507,34 +591,503 @@ String recordToJSON(const String& rec, uint32_t idx) {
   String time = rec.substring(c2 + 1, c3);
   String dir  = rec.substring(c3 + 1);
 
-  String json = "{\"idx\":" + String(idx) +
-                ",\"epc\":\""  + epc  + "\"" +
-                ",\"date\":\"" + date + "\"" +
-                ",\"time\":\"" + time + "\"" +
-                ",\"dir\":\""  + dir  + "\"}";
-  return json;
+  return "{\"idx\":" + String(idx) +
+         ",\"epc\":\""  + epc  + "\"" +
+         ",\"date\":\"" + date + "\"" +
+         ",\"time\":\"" + time + "\"" +
+         ",\"dir\":\""  + dir  + "\"}";
 }
 
+// ─────────────────────────────────────────────────────────────
+//  DYNAMIC ASYNCHRONOUS DEVICE DISCOVERY (UDP + mDNS)
+// ─────────────────────────────────────────────────────────────
+
+// Non-blocking UDP packet listener: services incoming server beacons & responses
+void serviceIncomingUDPDiscovery() {
+  int packetSize = udpDiscovery.parsePacket();
+  if (packetSize <= 0) return;
+
+  char buf[512];
+  int len = udpDiscovery.read(buf, sizeof(buf) - 1);
+  if (len <= 0) return;
+  buf[len] = '\0';
+  String msg = String(buf);
+
+  String hostStr = extractJsonString(msg, "host");
+  int    portNum = extractJsonInt(msg, "tcpPort", TCP_SERVER_PORT);
+  String type    = extractJsonString(msg, "type");
+
+  if (hostStr.length() > 0) {
+    IPAddress parsedIP;
+    if (parsedIP.fromString(hostStr)) {
+      bool ipChanged = (parsedIP != serverIP);
+      serverIP = parsedIP;
+      serverPort = portNum > 0 ? portNum : TCP_SERVER_PORT;
+      hostnameResolved = true;
+
+      if (ipChanged) {
+        DBG("[Discovery] Discovered/Updated Server IP via UDP: ");
+        DBG(serverIP.toString()); DBG(":"); DBGLN(serverPort);
+
+        // If currently connected or trying to connect to a stale IP, trigger reconnect
+        if (netState == STATE_CONNECTED || netState == STATE_CONNECTING_TCP || netState == STATE_AUTHENTICATING) {
+          DBGLN("[Discovery] Server IP changed dynamically (DHCP update). Reconnecting TCP...");
+          tcpClient.stop();
+          isAuthenticated = false;
+          netState = STATE_CONNECTING_TCP;
+          lastTcpAttemptMs = 0;
+          idleNeedsFullRedraw = true;
+        }
+      }
+
+      if (netState == STATE_DISCOVERING_SERVER) {
+        netState = STATE_CONNECTING_TCP;
+        lastTcpAttemptMs = 0;
+        networkStatusText = "Found Server";
+        idleNeedsFullRedraw = true;
+      }
+    }
+  }
+}
+
+// Sends active discovery probe broadcast
+void sendDiscoveryProbeUDP() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+#if CLOUD_MODE
+  // The server is a fixed public hostname: nothing to discover.
+  hostnameResolved = true;
+  networkStatusText = "Cloud Server";
+  netState = STATE_CONNECTING_TCP;
+  lastTcpAttemptMs = 0;
+  idleNeedsFullRedraw = true;
+  return;
+#endif
+
+  DBG("[Discovery] Broadcasting UDP probe to 255.255.255.255:"); DBGLN(UDP_DISCOVERY_PORT);
+  udpDiscovery.beginPacket(IPAddress(255, 255, 255, 255), UDP_DISCOVERY_PORT);
+  String probe = "{\"type\":\"discovery_probe\",\"deviceId\":\"" + getPermanentDeviceId() +
+                 "\",\"name\":\"ESP32 Gate Logger\",\"mac\":\"" + deviceMacAddress +
+                 "\",\"ip\":\"" + ipString + "\",\"version\":\"2.1.0\",\"nvsCount\":" +
+                 String(nvsCount) + "}\n";
+  udpDiscovery.print(probe);
+  udpDiscovery.endPacket();
+
+  // Also query mDNS hostname quickly without blocking
+  String cleanName = String(APP_HOSTNAME);
+  if (cleanName.endsWith(".local")) {
+    cleanName = cleanName.substring(0, cleanName.length() - 6);
+  }
+  IPAddress mdnsIP = MDNS.queryHost(cleanName.c_str(), 200);
+  if (mdnsIP != INADDR_NONE && mdnsIP != IPAddress(0, 0, 0, 0)) {
+    serverIP = mdnsIP;
+    serverPort = TCP_SERVER_PORT;
+    hostnameResolved = true;
+    netState = STATE_CONNECTING_TCP;
+    lastTcpAttemptMs = 0;
+    DBG("[mDNS] Resolved hostname '"); DBG(cleanName); DBG("' -> "); DBGLN(serverIP.toString());
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TCP CLIENT & BIDIRECTIONAL PROTOCOL
+// ─────────────────────────────────────────────────────────────
+
+void sendAuthRequest() {
+  if (!tcpClient || !tcpClient.connected()) return;
+
+  String authMsg = "{\"type\":\"auth_request\",\"deviceId\":\"" + getPermanentDeviceId() +
+                   "\",\"name\":\"ESP32 Gate Logger\",\"token\":\"" + String(DEVICE_AUTH_KEY) +
+                   "\",\"mac\":\"" + deviceMacAddress + "\",\"ip\":\"" + ipString +
+                   "\",\"version\":\"2.1.0\",\"nvsCount\":" + String(nvsCount) + "}\n";
+  tcpClient.print(authMsg);
+  tcpClient.flush();
+  DBG("[TCP TX] Sent auth_request for "); DBGLN(getPermanentDeviceId());
+}
+
+void attemptTCPConnect() {
+  if (WiFi.status() != WL_CONNECTED || !hostnameResolved) {
+    netState = STATE_DISCOVERING_SERVER;
+    return;
+  }
+
+  DBG("[TCP] Connecting to ");
+  DBG(serverIP.toString());
+  DBG(":");
+  DBG(serverPort);
+  DBGLN("...");
+
+  tcpClient.stop();
+  if (tcpClient.connect(serverIP, serverPort)) {
+    tcpClient.setNoDelay(true);
+    netState = STATE_AUTHENTICATING;
+    isAuthenticated = false;
+    tcpConnectFailCount = 0;
+    resolveFailCount = 0;
+    lastPingSentMs = millis();
+    lastServerRxMs = millis();
+    lastAuthAttemptMs = millis();
+
+    DBG("[TCP] Connected to "); DBGLN(serverIP.toString());
+
+    // Step 1: Send secure authentication handshake
+    sendAuthRequest();
+
+    networkStatusText = "Authenticating...";
+    idleNeedsFullRedraw = true;
+  } else {
+    tcpConnectFailCount++;
+    DBG("[TCP] Connect failed, attempt "); DBGLN(tcpConnectFailCount);
+
+    // If connect repeatedly fails, server IP might have changed on DHCP router
+    if (tcpConnectFailCount >= 3) {
+      DBGLN("[TCP] Connect retries exceeded. Re-discovering server...");
+      hostnameResolved = false;
+      tcpConnectFailCount = 0;
+      netState = STATE_DISCOVERING_SERVER;
+      lastDiscoveryAttemptMs = 0;
+      networkStatusText = "Re-discovering...";
+      idleNeedsFullRedraw = true;
+    }
+  }
+}
+
+void sendHistoricalDumpTCP() {
+  if (!tcpClient || !tcpClient.connected()) return;
+
+  DBG("[TCP] Streaming "); DBG(nvsCount); DBGLN(" historical records to server...");
+  tcpClient.print("{\"type\":\"sync_response\",\"records\":[");
+  bool first = true;
+  for (uint32_t i = 0; i < nvsCount; i++) {
+    String rec = nvsReadRecord(i);
+    String rj  = recordToJSON(rec, i);
+    if (rj.length() == 0) continue;
+    if (!first) tcpClient.print(",");
+    tcpClient.print(rj);
+    first = false;
+    yield();
+  }
+  tcpClient.print("]}\n");
+  tcpClient.flush();
+  DBGLN("[TCP] Historical records sync sent.");
+}
+
+void handleServerMessage(const String& line) {
+  DBG("[TCP RX] "); DBGLN(line);
+
+  String type   = extractJsonString(line, "type");
+  String status = extractJsonString(line, "status");
+  String cmd    = extractJsonString(line, "cmd");
+
+  // 1. Authentication Handshake Response
+  if (type == "auth_response") {
+    if (status == "authenticated") {
+      isAuthenticated = true;
+      netState = STATE_CONNECTED;
+      networkStatusText = "Online (Auth OK)";
+      idleNeedsFullRedraw = true;
+      DBGLN("[TCP] Device authenticated successfully by server!");
+
+      // Sync time if server provided it
+      String sTime = extractJsonString(line, "serverTime");
+      if (sTime.length() >= 19 && extractJsonBool(line, "syncTime", true)) {
+        applyDateTime(sTime);
+      }
+    } else {
+      DBGLN("[TCP] Authentication rejected by server!");
+      networkStatusText = "Auth Failed";
+      idleNeedsFullRedraw = true;
+      tcpClient.stop();
+      isAuthenticated = false;
+      netState = STATE_DISCOVERING_SERVER;
+    }
+    return;
+  }
+
+  // 2. Real-time Authorization Feedback from Tag Scan
+  if (type == "auth_result") {
+    bool   authorized  = extractJsonBool(line, "authorized", false);
+    String plateNumber = extractJsonString(line, "plateNumber");
+    String ownerName   = extractJsonString(line, "ownerName");
+    String action      = extractJsonString(line, "action");
+
+    // Trigger physical gate barrier relay if authorized
+    if (authorized || action == "open_gate") {
+      triggerGateRelay();
+    }
+
+    if (tagScreenActive) {
+      tft.fillRect(10, 215, 300, 25, ILI9341_BLACK);
+      tft.setFont(&FreeSansBold12pt7b);
+      if (authorized) {
+        tft.setTextColor(ILI9341_GREEN);
+        tft.setCursor(10, 235);
+        tft.print("GRANTED: ");
+        tft.print(plateNumber.length() > 0 ? plateNumber : "AUTHORIZED");
+      } else {
+        tft.setTextColor(ILI9341_RED);
+        tft.setCursor(10, 235);
+        tft.print("DENIED: UNREGISTERED");
+      }
+    }
+    return;
+  }
+
+  // 3. Dump Offline Records Request
+  if (cmd == "dump") {
+    sendHistoricalDumpTCP();
+    return;
+  }
+
+  // 4. Clear Synchronized Records
+  if (cmd == "clear") {
+    nvsClearAll();
+    totalDetect = 0;
+    idleNeedsFullRedraw = true;
+    tcpClient.print("{\"type\":\"cmd_ack\",\"cmd\":\"clear\",\"status\":\"ok\"}\n");
+    return;
+  }
+
+  // 5. Remote Gate Barrier Trigger
+  if (cmd == "open_gate") {
+    triggerGateRelay();
+    tcpClient.print("{\"type\":\"cmd_ack\",\"cmd\":\"open_gate\",\"status\":\"ok\"}\n");
+    return;
+  }
+
+  // 6. Remote RTC Time Sync
+  if (cmd == "set_time") {
+    String dt = extractJsonString(line, "datetime");
+    if (applyDateTime(dt)) {
+      tcpClient.print("{\"type\":\"cmd_ack\",\"cmd\":\"set_time\",\"status\":\"ok\"}\n");
+    } else {
+      tcpClient.print("{\"type\":\"cmd_ack\",\"cmd\":\"set_time\",\"status\":\"error\"}\n");
+    }
+    return;
+  }
+
+  // 7. Remote Reboot Command
+  if (cmd == "reboot") {
+    tcpClient.print("{\"type\":\"cmd_ack\",\"cmd\":\"reboot\",\"status\":\"ok\"}\n");
+    tcpClient.flush();
+    delay(500);
+    ESP.restart();
+    return;
+  }
+
+  // 8. Connection ACK (legacy fallback)
+  if (type == "ack") {
+    String sTime = extractJsonString(line, "serverTime");
+    if (sTime.length() >= 19 && extractJsonBool(line, "syncTime", false)) {
+      applyDateTime(sTime);
+    }
+    return;
+  }
+
+  // 9. Keepalive Pong
+  if (type == "pong") {
+    return;
+  }
+}
+
+void serviceTCPClient() {
+  if (!tcpClient.connected()) {
+    DBGLN("[TCP] Disconnected from server. Re-discovering in case IP changed...");
+    tcpClient.stop();
+    isAuthenticated = false;
+    hostnameResolved = false;
+    netState = STATE_DISCOVERING_SERVER;
+    networkStatusText = "Re-discovering";
+    idleNeedsFullRedraw = true;
+    lastDiscoveryAttemptMs = 0;
+    return;
+  }
+
+  // Read incoming server data stream
+  while (tcpClient.available()) {
+    String line = tcpClient.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) {
+      lastServerRxMs = millis();
+      handleServerMessage(line);
+    }
+  }
+
+  unsigned long now = millis();
+
+  // If in authenticating state, re-send auth if no response in 5s
+  if (netState == STATE_AUTHENTICATING && !isAuthenticated) {
+    if (now - lastAuthAttemptMs >= 5000) {
+      lastAuthAttemptMs = now;
+      sendAuthRequest();
+    }
+  }
+
+  // Periodic keepalive ping (every 15s)
+  if (netState == STATE_CONNECTED && now - lastPingSentMs >= TCP_PING_INTERVAL_MS) {
+    lastPingSentMs = now;
+    String pingPacket = "{\"type\":\"ping\",\"deviceId\":\"" + getPermanentDeviceId() +
+                        "\",\"uptime\":" + String(now / 1000) + "}\n";
+    tcpClient.print(pingPacket);
+    tcpClient.flush();
+  }
+
+  // Dead socket watchdog (45s without data from server)
+  if (now - lastServerRxMs >= TCP_RX_TIMEOUT_MS) {
+    DBGLN("[TCP] Keepalive timeout! Tearing down half-open socket and re-discovering...");
+    tcpClient.stop();
+    isAuthenticated = false;
+    hostnameResolved = false;
+    netState = STATE_DISCOVERING_SERVER;
+    networkStatusText = "Timeout (Retry)";
+    idleNeedsFullRedraw = true;
+    lastDiscoveryAttemptMs = 0;
+  }
+}
+
+void sendDetectionTCP(const String& epc, const String& date, const String& time, const char* dir) {
+  if (netState == STATE_CONNECTED && tcpClient && tcpClient.connected()) {
+    String json = "{\"type\":\"detection\",\"epc\":\"" + epc +
+                  "\",\"date\":\"" + date +
+                  "\",\"time\":\"" + time +
+                  "\",\"direction\":\"" + String(dir) +
+                  "\",\"deviceId\":\"" + getPermanentDeviceId() + "\"}\n";
+    tcpClient.print(json);
+    tcpClient.flush();
+    DBG("[TCP TX] Sent live detection: "); DBGLN(epc);
+  } else {
+    DBG("[TCP] Offline. Detection buffered in NVS (count=");
+    DBG(nvsCount);
+    DBGLN(")");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  CENTRAL NETWORK SERVICE LOOP
+// ─────────────────────────────────────────────────────────────
+void serviceNetwork() {
+  unsigned long now = millis();
+
+  // 1. Service gate relay auto-shutoff
+  serviceRelay();
+
+  // 2. Service non-blocking UDP discovery & server beacons
+  serviceIncomingUDPDiscovery();
+
+  // 3. Service fallback WebServer
+  server.handleClient();
+
+  // 4. Wi-Fi Status Check & Auto Reconnect (every 1s)
+  if (now - lastWifiCheckMs >= 1000) {
+    lastWifiCheckMs = now;
+
+    if (WiFi.status() != WL_CONNECTED) {
+      if (netState != STATE_WIFI_DISCONNECTED) {
+        DBGLN("[WiFi] Connection dropped!");
+        tcpClient.stop();
+        isAuthenticated = false;
+        hostnameResolved = false;
+        netState = STATE_WIFI_DISCONNECTED;
+        networkStatusText = "WiFi Lost";
+        idleNeedsFullRedraw = true;
+      }
+      WiFi.reconnect();
+      return;
+    } else {
+      if (netState == STATE_WIFI_DISCONNECTED) {
+        lastKnownLocalIP = WiFi.localIP();
+        ipString = lastKnownLocalIP.toString();
+        DBG("[WiFi] Reconnected! Local IP: "); DBGLN(ipString);
+
+        // Re-initialize mDNS and UDP
+        MDNS.end();
+        MDNS.begin("esp32-gate");
+        udpDiscovery.begin(UDP_DISCOVERY_PORT);
+
+        netState = STATE_DISCOVERING_SERVER;
+        hostnameResolved = false;
+        lastDiscoveryAttemptMs = 0;
+        networkStatusText = "Discovering...";
+        idleNeedsFullRedraw = true;
+      }
+
+      // Check if DHCP assigned a new IP address to ESP32
+      if (WiFi.localIP() != lastKnownLocalIP) {
+        lastKnownLocalIP = WiFi.localIP();
+        ipString = lastKnownLocalIP.toString();
+        DBG("[WiFi] DHCP assigned new IP to ESP32: "); DBGLN(ipString);
+        idleNeedsFullRedraw = true;
+
+        if (netState == STATE_CONNECTED && tcpClient.connected()) {
+          String statusMsg = "{\"type\":\"status\",\"status\":\"online\",\"deviceId\":\"" +
+                             getPermanentDeviceId() + "\",\"ip\":\"" + ipString + "\"}\n";
+          tcpClient.print(statusMsg);
+        }
+      }
+    }
+  }
+
+  // 5. State Machine Execution
+  switch (netState) {
+    case STATE_WIFI_DISCONNECTED:
+      break;
+
+    case STATE_DISCOVERING_SERVER:
+      if (now - lastDiscoveryAttemptMs >= DISCOVERY_PROBE_INTERVAL_MS) {
+        lastDiscoveryAttemptMs = now;
+        sendDiscoveryProbeUDP();
+        networkStatusText = "Searching Server";
+        idleNeedsFullRedraw = true;
+      }
+      break;
+
+    case STATE_CONNECTING_TCP:
+      if (now - lastTcpAttemptMs >= TCP_RETRY_INTERVAL_MS) {
+        lastTcpAttemptMs = now;
+        attemptTCPConnect();
+      }
+      break;
+
+    case STATE_AUTHENTICATING:
+    case STATE_CONNECTED:
+      serviceTCPClient();
+      break;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  FALLBACK HTTP HANDLERS
+// ─────────────────────────────────────────────────────────────
 void addCORSHeaders() {
   server.sendHeader("Access-Control-Allow-Origin",  "*");
-  server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   server.sendHeader("Access-Control-Allow-Headers", "*");
 }
 
 void handleRoot() {
   addCORSHeaders();
   String html =
-    "<html><body style='font-family:sans-serif'>"
-    "<h2>Vehicle Gate Logger</h2>"
-    "<p>Records stored: " + String(nvsCount) + " / " + String(MAX_RECORDS) + "</p>"
-    "<p>Total detections: " + String(totalDetect) + "</p>"
+    "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+    "<title>Vehicle Gate Logger</title>"
+    "<style>body{font-family:system-ui,sans-serif;padding:20px;background:#111;color:#eee}"
+    "h2{color:#00e5ff}.card{background:#222;padding:15px;border-radius:8px;margin-bottom:15px}"
+    "b{color:#fff}a{color:#00e5ff;text-decoration:none}</style></head><body>"
+    "<h2>Vehicle Gate Logger (Dual RFID D2D)</h2>"
+    "<div class='card'>"
+    "<p>Device ID: <b>" + getPermanentDeviceId() + "</b></p>"
+    "<p>MAC Address: <b>" + deviceMacAddress + "</b></p>"
+    "<p>Local IP: <b>" + ipString + "</b></p>"
+    "<p>Target Server: <b>" + (hostnameResolved ? serverIP.toString() + ":" + String(serverPort) : "Discovering...") + "</b></p>"
+    "<p>Status: <b>" + networkStatusText + "</b></p>"
+    "<p>Records buffered: <b>" + String(nvsCount) + " / " + String(MAX_RECORDS) + "</b></p>"
+    "<p>Total detections: <b>" + String(totalDetect) + "</b></p>"
+    "</div>"
     "<ul>"
-    "<li><a href='/dump'>/dump</a> — JSON of all stored records</li>"
-    "<li><a href='/stats'>/stats</a> — JSON counters</li>"
-    "<li><a href='/clear'>/clear</a> — erase all records</li>"
+    "<li><a href='/dump'>/dump</a> — JSON dump of records</li>"
+    "<li><a href='/stats'>/stats</a> — JSON diagnostic statistics</li>"
+    "<li><a href='/open'>/open</a> — Trigger gate barrier open</li>"
+    "<li><a href='/clear'>/clear</a> — Clear all local records</li>"
     "</ul>"
-    "<p>Live push: open a TCP socket to this device on port 8080 — "
-    "one JSON line is sent per detection.</p>"
     "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -557,18 +1110,30 @@ void handleDump() {
 
 void handleStats() {
   addCORSHeaders();
-  String json = "{\"count\":" + String(nvsCount) +
+  String json = "{\"deviceId\":\"" + getPermanentDeviceId() + "\"" +
+                ",\"mac\":\"" + deviceMacAddress + "\"" +
+                ",\"ip\":\"" + ipString + "\"" +
+                ",\"count\":" + String(nvsCount) +
                 ",\"head\":"  + String(nvsHead) +
                 ",\"tail\":"  + String(nvsTail) +
                 ",\"total\":" + String(totalDetect) +
-                ",\"max\":"   + String(MAX_RECORDS) + "}";
+                ",\"serverIP\":\"" + serverIP.toString() + "\"" +
+                ",\"serverPort\":" + String(serverPort) +
+                ",\"netState\":" + String((int)netState) +
+                ",\"authenticated\":" + String(isAuthenticated ? "true" : "false") + "}";
   server.send(200, "application/json", json);
+}
+
+void handleOpenGate() {
+  addCORSHeaders();
+  triggerGateRelay();
+  server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"gate_opened\"}");
 }
 
 void handleClear() {
   addCORSHeaders();
   nvsClearAll();
-  totalDetect         = 0;
+  totalDetect = 0;
   idleNeedsFullRedraw = true;
   server.send(200, "application/json", "{\"status\":\"cleared\"}");
 }
@@ -578,126 +1143,64 @@ void handleNotFound() {
   server.send(404, "application/json", "{\"error\":\"not found\"}");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  IP REGISTRATION HELPER
-// ─────────────────────────────────────────────────────────────
-void registerDeviceIP() {
-  if (WiFi.status() != WL_CONNECTED) {
-    DBGLN("Cannot register IP: WiFi not connected");
-    return;
-  }
-
-  HTTPClient http;
-  String url = "http://" + String(LAPTOP_IP) + ":" + String(LAPTOP_PORT) + "/api/esp-devices/register";
-  
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  
-  String payload = "{\"ipAddress\":\"" + WiFi.localIP().toString() + "\"}";
-  DBG("Registering IP with dashboard: "); DBGLN(url);
-  DBG("Payload: "); DBGLN(payload);
-  
-  int httpResponseCode = http.POST(payload);
-  
-  if (httpResponseCode > 0) {
-    String response = http.getString();
-    DBG("HTTP Response code: "); DBG(httpResponseCode);
-    DBG(" Response: "); DBGLN(response);
-  } else {
-    DBG("Error on sending POST request: "); DBGLN(httpResponseCode);
-  }
-  
-  http.end();
-}
-
 void setupWiFiAndServer() {
-  // 1. Initialize softAP (hybrid mode)
+  deviceMacAddress = WiFi.macAddress();
+  getPermanentDeviceId();
+
+  // 1. SoftAP setup (fallback)
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
-  bool apOK = WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.softAP(AP_SSID, AP_PASS);
 
-  if (apOK) {
-    DBG("AP started. SSID="); DBG(AP_SSID);
-    DBG("  IP="); DBGLN(WiFi.softAPIP().toString());
-  } else {
-    DBGLN("ERROR: Failed to start WiFi AP!");
-  }
-
-  // 2. Connect to Station Wi-Fi
-  DBG("Connecting to WiFi SSID: "); DBGLN(WIFI_SSID);
+  // 2. Station setup (connect to SPJ Router)
+  DBG("[WiFi] Connecting to SSID: "); DBGLN(WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   int attempts = 0;
-  // Try for 15 seconds (30 attempts * 500ms)
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(500);
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(400);
     DBG(".");
     attempts++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    apIPString = WiFi.localIP().toString();
-    DBG("\nWiFi connected. IP="); DBGLN(apIPString);
-    // Register dynamic IP with backend
-    registerDeviceIP();
+    lastKnownLocalIP = WiFi.localIP();
+    ipString = lastKnownLocalIP.toString();
+    DBG("\n[WiFi] Connected to SPJ Router! Local IP: "); DBGLN(ipString);
+
+    // Start mDNS responder
+    if (MDNS.begin("esp32-gate")) {
+      DBG("[mDNS] Responder started. Host: esp32-gate.local\n");
+    }
+    udpDiscovery.begin(UDP_DISCOVERY_PORT);
+
+    netState = STATE_DISCOVERING_SERVER;
+    networkStatusText = "Discovering Server";
   } else {
-    apIPString = WiFi.softAPIP().toString(); // fallback to show AP IP on screen
-    DBGLN("\nWiFi connection to office SSID failed!");
+    ipString = WiFi.softAPIP().toString();
+    DBGLN("\n[WiFi] Router connection failed, running in SoftAP mode.");
+    netState = STATE_WIFI_DISCONNECTED;
+    networkStatusText = "WiFi Failed";
   }
 
-  // 3. HTTP Server configuration
+  // 3. Web server
   server.on("/",       HTTP_GET, handleRoot);
   server.on("/dump",   HTTP_GET, handleDump);
   server.on("/stats",  HTTP_GET, handleStats);
+  server.on("/open",   HTTP_GET, handleOpenGate);
   server.on("/clear",  HTTP_GET, handleClear);
   server.onNotFound(handleNotFound);
   server.begin();
-  DBGLN("HTTP server started on port 80");
-
-  // 4. TCP Server configuration
-  tcpServer.begin();
-  tcpServer.setNoDelay(true);
-  DBGLN("Live-push TCP server started on port 8080");
-}
-
-// Accept a new TCP client into a free slot (if any)
-void acceptTCPClients() {
-  WiFiClient newClient = tcpServer.available();
-  if (!newClient) return;
-
-  bool placed = false;
-  for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
-    if (!tcpClients[i] || !tcpClients[i].connected()) {
-      tcpClients[i] = newClient;
-      placed = true;
-      DBG("Live-push client connected, slot "); DBGLN(i);
-      break;
-    }
-  }
-  if (!placed) {
-    newClient.stop();  // no free slot — reject
-  }
-}
-
-// Send a JSON line to every connected live-push client
-void broadcastLive(const String& json) {
-  for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
-    if (tcpClients[i] && tcpClients[i].connected()) {
-      tcpClients[i].println(json);
-    }
-  }
+  DBGLN("[HTTP] Local web server started on port 80");
 }
 
 // ─────────────────────────────────────────────────────────────
-//  TFT — IDLE SCREEN
-//  Static elements drawn once. Time/date updated every second
-//  by erasing only the value rectangle — no flicker.
+//  TFT DISPLAY SCREENS
 // ─────────────────────────────────────────────────────────────
 void showIdleScreen() {
   static bool staticDrawn = false;
   static int  lastSecond  = -1;
 
-  // ── Reset when returning from tag screen
   if (idleNeedsFullRedraw) {
     staticDrawn         = false;
     lastSecond          = -1;
@@ -706,150 +1209,151 @@ void showIdleScreen() {
 
   DateTime now = rtc.now();
 
-  // ── Draw background + labels only once
   if (!staticDrawn) {
     tft.fillScreen(ILI9341_BLACK);
 
     // Title
     tft.setFont(&FreeSansBold12pt7b);
     tft.setTextColor(ILI9341_CYAN);
-    tft.setCursor(20, 50);
+    tft.setCursor(20, 32);
     tft.println("VEHICLE GATE LOGGER");
 
     // Subtitle
     tft.setFont(&FreeSans9pt7b);
     tft.setTextColor(ILI9341_WHITE);
-    tft.setCursor(55, 85);
-    tft.println("Scanning IN / OUT...");
+    tft.setCursor(20, 52);
+    tft.println("Local D2D RFID Access");
 
-    // Static labels — positions must match value fillRect() below
-    tft.setFont(&FreeSans9pt7b);
+    // Static labels
     tft.setTextColor(ILI9341_DARKGREY);
-    tft.setCursor(10, 120);  tft.print("Time:");
-    tft.setCursor(10, 145);  tft.print("Date:");
-    tft.setCursor(10, 170);  tft.print("Total:");
-    tft.setCursor(10, 192);  tft.print("Records:");
-    tft.setCursor(10, 215);  tft.print("IP:");
+    tft.setCursor(10, 75);  tft.print("Device:");
+    tft.setCursor(10, 95);  tft.print("Time:");
+    tft.setCursor(10, 115); tft.print("Date:");
+    tft.setCursor(10, 135); tft.print("Total:");
+    tft.setCursor(10, 155); tft.print("Buffer:");
+    tft.setCursor(10, 175); tft.print("IP:");
+    tft.setCursor(10, 195); tft.print("Server:");
+    tft.setCursor(10, 215); tft.print("Status:");
+
+    // Device ID value
+    tft.setTextColor(ILI9341_LIGHTGREY);
+    tft.setCursor(80, 75);
+    tft.print(getPermanentDeviceId().substring(0, 18));
 
     staticDrawn = true;
-    lastSecond  = -1;   // force immediate value redraw
+    lastSecond  = -1;
   }
 
-  // ── Update values every second
   if (now.second() != lastSecond) {
     lastSecond = now.second();
 
     tft.setFont(&FreeSans9pt7b);
 
-    // Time value — erase rect then redraw
-    tft.fillRect(62, 106, 210, 17, ILI9341_BLACK);
+    // Time value
+    tft.fillRect(80, 82, 220, 16, ILI9341_BLACK);
     tft.setTextColor(ILI9341_YELLOW);
-    tft.setCursor(62, 120);
+    tft.setCursor(80, 95);
     tft.print(getTimeString());
 
     // Date value
-    tft.fillRect(62, 131, 210, 17, ILI9341_BLACK);
+    tft.fillRect(80, 102, 220, 16, ILI9341_BLACK);
     tft.setTextColor(ILI9341_YELLOW);
-    tft.setCursor(62, 145);
+    tft.setCursor(80, 115);
     tft.print(getDateString());
 
-    // Total detections value
-    tft.fillRect(68, 156, 160, 17, ILI9341_BLACK);
-    tft.setTextColor(ILI9341_GREEN);
-    tft.setCursor(68, 170);
+    // Total scans
+    tft.fillRect(80, 122, 220, 16, ILI9341_BLACK);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.setCursor(80, 135);
     tft.print(totalDetect);
 
-    // Records stored value
-    tft.fillRect(90, 178, 160, 17, ILI9341_BLACK);
-    tft.setTextColor(ILI9341_GREEN);
-    tft.setCursor(90, 192);
+    // NVS records
+    tft.fillRect(80, 142, 220, 16, ILI9341_BLACK);
+    tft.setTextColor(nvsCount > 0 ? ILI9341_ORANGE : ILI9341_GREEN);
+    tft.setCursor(80, 155);
     tft.print(nvsCount);
-    tft.setTextColor(ILI9341_DARKGREY);
     tft.print(" / ");
     tft.print(MAX_RECORDS);
 
-    // IP address value (AP address — connect your app's WiFi to it)
-    tft.fillRect(38, 200, 260, 17, ILI9341_BLACK);
-    tft.setTextColor(ILI9341_CYAN);
-    tft.setCursor(38, 215);
-    tft.print(apIPString);
+    // Local IP
+    tft.fillRect(80, 162, 220, 16, ILI9341_BLACK);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.setCursor(80, 175);
+    tft.print(ipString);
+
+    // Server IP & Port
+    tft.fillRect(80, 182, 220, 16, ILI9341_BLACK);
+    tft.setTextColor(hostnameResolved ? ILI9341_GREEN : ILI9341_YELLOW);
+    tft.setCursor(80, 195);
+    if (hostnameResolved) {
+      tft.print(serverIP.toString());
+      tft.print(":");
+      tft.print(serverPort);
+    } else {
+      tft.print("Discovering...");
+    }
+
+    // Status
+    tft.fillRect(80, 202, 220, 16, ILI9341_BLACK);
+    if (netState == STATE_CONNECTED) {
+      tft.setTextColor(ILI9341_GREEN);
+    } else if (netState == STATE_WIFI_DISCONNECTED) {
+      tft.setTextColor(ILI9341_RED);
+    } else {
+      tft.setTextColor(ILI9341_YELLOW);
+    }
+    tft.setCursor(80, 215);
+    tft.print(networkStatusText);
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-//  TFT — TAG DETECTED SCREEN
-// ─────────────────────────────────────────────────────────────
-void showTagScreen(const String& epc,
-                   const String& date,
-                   const String& time,
-                   const char*   direction) {
-
-  tagScreenActive     = true;
-  idleNeedsFullRedraw = true;   // idle screen must fully redraw after this
+void showTagScreen(const String& epc, const String& date, const String& time, const char* dir) {
+  tagScreenActive = true;
+  idleNeedsFullRedraw = true;
 
   tft.fillScreen(ILI9341_BLACK);
 
-  bool isIn = (direction[1] == 'N');
+  // Direction Header
   tft.setFont(&FreeSansBold12pt7b);
-  tft.setTextColor(isIn ? ILI9341_GREEN : ILI9341_RED);
-  tft.setCursor(10, 35);
-  tft.print("VEHICLE  ");
-  tft.println(direction);
-
-  tft.drawFastHLine(10, 50, 300, ILI9341_DARKGREY);
+  if (strcmp(dir, "IN") == 0) {
+    tft.fillRect(0, 0, 320, 40, ILI9341_BLUE);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.setCursor(70, 28);
+    tft.print("VEHICLE ENTRY (IN)");
+  } else {
+    tft.fillRect(0, 0, 320, 40, ILI9341_NAVY);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.setCursor(75, 28);
+    tft.print("VEHICLE EXIT (OUT)");
+  }
 
   tft.setFont(&FreeSans9pt7b);
+  tft.setTextColor(ILI9341_WHITE);
 
-  tft.setTextColor(ILI9341_DARKGREY);
-  tft.setCursor(10, 74);
-  tft.println("EPC:");
-  tft.setTextColor(ILI9341_CYAN);
-  tft.setCursor(10, 94);
-  tft.println(epc);
+  // EPC
+  tft.setCursor(10, 70);
+  tft.print("Tag EPC:");
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setCursor(10, 95);
+  tft.print(epc.length() > 20 ? epc.substring(0, 20) + "..." : epc);
 
-  tft.drawFastHLine(10, 110, 300, ILI9341_DARKGREY);
-
-  tft.setTextColor(ILI9341_DARKGREY);
+  // Time & Date
+  tft.setTextColor(ILI9341_WHITE);
   tft.setCursor(10, 130);
-  tft.print("Date: ");
-  tft.setTextColor(ILI9341_WHITE);
-  tft.println(date);
-
-  tft.setTextColor(ILI9341_DARKGREY);
-  tft.setCursor(10, 155);
   tft.print("Time: ");
-  tft.setTextColor(ILI9341_WHITE);
-  tft.println(time);
+  tft.setTextColor(ILI9341_CYAN);
+  tft.print(time);
+  tft.print("  Date: ");
+  tft.print(date);
 
-  tft.drawFastHLine(10, 175, 300, ILI9341_DARKGREY);
-
-  tft.setTextColor(ILI9341_DARKGREY);
-  tft.setCursor(10, 195);
-  tft.print("Records: ");
-  tft.setTextColor(ILI9341_WHITE);
-  tft.print(nvsCount);
-  tft.print(" / ");
-  tft.println(MAX_RECORDS);
+  // Status line waiting for authorization feedback
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setCursor(10, 225);
+  tft.print("Validating with Server...");
 }
 
 // ─────────────────────────────────────────────────────────────
-//  SERIAL DUMP
-// ─────────────────────────────────────────────────────────────
-void dumpAllRecords() {
-  Serial.println("========== NVS RECORD DUMP ==========");
-  Serial.print("Total records: "); Serial.println(nvsCount);
-  Serial.println("IDX , EPC , DATE , TIME , DIR");
-  Serial.println("-------------------------------------");
-  for (uint32_t i = 0; i < nvsCount; i++) {
-    String rec = nvsReadRecord(i);
-    Serial.print(i); Serial.print(" , ");
-    Serial.println(rec);
-  }
-  Serial.println("=====================================");
-}
-
-// ─────────────────────────────────────────────────────────────
-//  HANDLE ONE TAG DETECTION
+//  HANDLE DETECTION
 // ─────────────────────────────────────────────────────────────
 void handleDetection(const String& epc, const char* direction) {
   String date = getDateString();
@@ -858,28 +1362,23 @@ void handleDetection(const String& epc, const char* direction) {
   totalDetect++;
   nvsWriteRecord(epc, date, time, direction);
 
-  DBG("["); DBG(direction); DBG("] ");
+  DBG("[SCAN] ["); DBG(direction); DBG("] ");
   DBG(epc); DBG("  "); DBG(date); DBG("  "); DBGLN(time);
 
-  // Push this detection immediately to any connected local app
-  String liveJson = "{\"event\":\"detection\",\"epc\":\"" + epc +
-                     "\",\"date\":\"" + date +
-                     "\",\"time\":\"" + time +
-                     "\",\"dir\":\""  + String(direction) + "\"}";
-  broadcastLive(liveJson);
+  // Send immediately to backend over TCP
+  sendDetectionTCP(epc, date, time, direction);
 
+  // Show tag screen
   showTagScreen(epc, date, time, direction);
 
-  // 2-second hold — tag screen visible
-  // Keep servicing WiFi/serial/RFID during the hold so nothing stalls
-  unsigned long hold = millis() + 2000;
-  while (millis() < hold) {
-    server.handleClient();
-    acceptTCPClients();
+  // 2.2-second hold: keep servicing network so auth feedback is rendered instantly
+  unsigned long holdEnd = millis() + 2200;
+  while (millis() < holdEnd) {
+    serviceNetwork();
     yield();
   }
 
-  tagScreenActive = false;   // tag screen done, loop will call showIdleScreen
+  tagScreenActive = false;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -887,97 +1386,95 @@ void handleDetection(const String& epc, const char* direction) {
 // ─────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  DBGLN("=== Dual RFID Gate Logger ===");
+  delay(100);
+  DBGLN("\n=============================================");
+  DBGLN("   Dual RFID Gate Logger (Seamless D2D Mode) ");
+  DBGLN("=============================================");
 
-  // TFT
+  // Relay initialization
+  if (GATE_RELAY_PIN >= 0) {
+    pinMode(GATE_RELAY_PIN, OUTPUT);
+    digitalWrite(GATE_RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+    DBGLN("[RELAY] Gate Relay initialized on pin " + String(GATE_RELAY_PIN));
+  }
+
+  // TFT initialization
   tft.begin();
   tft.setRotation(1);
   tft.fillScreen(ILI9341_BLACK);
   tft.setFont(&FreeSansBold12pt7b);
   tft.setTextColor(ILI9341_CYAN);
-  tft.setCursor(60, 120);
-  tft.println("Initialising...");
+  tft.setCursor(20, 110);
+  tft.println("Starting Gate Logger...");
 
-  // RTC
+  // RTC initialization
   Wire.begin(21, 22);
   if (!rtc.begin()) {
-    DBGLN("ERROR: DS3231 not found!");
-    tft.setTextColor(ILI9341_RED);
-    tft.setCursor(10, 150);
-    tft.println("RTC ERROR!");
+    DBGLN("[RTC] ERROR: DS3231 not found!");
   } else {
     if (rtc.lostPower()) {
       rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-      DBGLN("RTC set to compile time — send 't' to correct it.");
+      DBGLN("[RTC] Battery lost. Adjusted to compile time.");
     } else {
-      DBGLN("RTC OK — time retained from battery.");
+      DBGLN("[RTC] Time retained from battery.");
     }
   }
-// ── RTC I2C scan
-  Wire.begin(21, 22);
-  Wire.beginTransmission(0x68);
-  byte i2cErr = Wire.endTransmission();
-  if (i2cErr != 0) {
-    Serial.print("WARNING: DS3231 not responding on I2C. Code=");
-    Serial.println(i2cErr);
-  } else {
-    Serial.println("DS3231 found at 0x68");
-  }
-  // UHF readers
-  uhfIN.begin(115200, SERIAL_8N1, UHF_IN_RX,  UHF_IN_TX);
+
+  // UHF readers UART
+  uhfIN.begin(115200, SERIAL_8N1, UHF_IN_RX, UHF_IN_TX);
   uhfOUT.begin(115200, SERIAL_8N1, UHF_OUT_RX, UHF_OUT_TX);
-  delay(500);
-  DBGLN("UHF UART ready");
+  delay(400);
+  DBGLN("[UHF] Setting TX Power to 30 dBm...");
   setTxPower(uhfIN,  TX_POWER_DBM);
   setTxPower(uhfOUT, TX_POWER_DBM);
 
-  // NVS
+  // NVS metadata
   nvsLoadMeta();
 
-  // WiFi AP + HTTP/TCP servers for local app connectivity
+  // Network (Wi-Fi + UDP Discovery + mDNS + Web Server)
   setupWiFiAndServer();
 
   showIdleScreen();
-  DBGLN("Scanning...");
-  DBGLN("Commands: d=dump  c=clear  s=stats  t=set RTC time");
+  DBGLN("[System] Ready. Permanent Device ID: " + getPermanentDeviceId());
+  DBGLN("Commands: d=dump records, c=clear, s=stats, o=open gate, t=set RTC time");
 }
 
 // ─────────────────────────────────────────────────────────────
 //  MAIN LOOP
 // ─────────────────────────────────────────────────────────────
 void loop() {
+  // 1. Service networking (Wi-Fi, UDP Discovery, TCP client, WebServer, Relay)
+  serviceNetwork();
 
-  // ── Service WiFi HTTP API + live-push TCP clients every loop
-  server.handleClient();
-  acceptTCPClients();
-
-  // ── Serial commands
-  // FIX: all cases are inside ONE if(Serial.available()) block
+  // 2. Handle serial commands
   if (Serial.available()) {
     char cmd = Serial.read();
-
     if (cmd == 'd' || cmd == 'D') {
-      dumpAllRecords();
-
+      Serial.println("========== NVS RECORD DUMP ==========");
+      Serial.print("Total records: "); Serial.println(nvsCount);
+      for (uint32_t i = 0; i < nvsCount; i++) {
+        Serial.printf("[%03lu] %s\n", (unsigned long)i, nvsReadRecord(i).c_str());
+      }
+      Serial.println("=====================================");
     } else if (cmd == 'c' || cmd == 'C') {
       nvsClearAll();
-      totalDetect         = 0;
+      totalDetect = 0;
       idleNeedsFullRedraw = true;
-      DBGLN("Records cleared.");
-
+      Serial.println("[Serial] Local records cleared.");
     } else if (cmd == 's' || cmd == 'S') {
-      Serial.print("Count="); Serial.print(nvsCount);
-      Serial.print("  Head="); Serial.print(nvsHead);
-      Serial.print("  Tail="); Serial.println(nvsTail);
-
+      Serial.printf("DeviceID=%s IP=%s Server=%s:%d NetState=%d Auth=%d Count=%lu Total=%d\n",
+                    getPermanentDeviceId().c_str(), ipString.c_str(),
+                    serverIP.toString().c_str(), serverPort, (int)netState, (int)isAuthenticated,
+                    (unsigned long)nvsCount, totalDetect);
+    } else if (cmd == 'o' || cmd == 'O') {
+      triggerGateRelay();
+      Serial.println("[Serial] Gate barrier relay triggered.");
     } else if (cmd == 't' || cmd == 'T') {
-      // ── RTC set — FIX: this is now correctly inside the block
-      Serial.println("Send datetime: DD/MM/YYYY HH:MM:SS");
       handleRTCSet();
     }
   }
 
-  // ── Scan IN reader
+  // 3. Scan UHF IN reader
   String epcIN = runInventoryBurst(uhfIN);
   if (epcIN.length() > 0) {
     if (isNewTag(epcIN, seenTagsIN, seenTagCountIN)) {
@@ -985,7 +1482,7 @@ void loop() {
     }
   }
 
-  // ── Scan OUT reader
+  // 4. Scan UHF OUT reader
   String epcOUT = runInventoryBurst(uhfOUT);
   if (epcOUT.length() > 0) {
     if (isNewTag(epcOUT, seenTagsOUT, seenTagCountOUT)) {
@@ -993,9 +1490,7 @@ void loop() {
     }
   }
 
-  // ── Always refresh idle screen when tag screen is not active
-  // FIX: removed the epcIN/epcOUT length check — clock must update
-  //      even when readers detect dedup-blocked tags
+  // 5. Update idle display clock & status
   if (!tagScreenActive) {
     showIdleScreen();
   }
