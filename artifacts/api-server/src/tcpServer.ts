@@ -388,8 +388,14 @@ export async function handleIncomingPacket(
     return;
   }
 
-  // Everything below carries data and must come from an authenticated controller.
-  if (!clientInfo.authenticated && ["detection", "sync_response", "ping"].includes(type)) {
+  // Internet (WebSocket) connections must authenticate before sending data.
+  // Raw TCP is LAN-only (disabled in the cloud), so older firmware that never
+  // sends auth_request keeps working exactly as before.
+  if (
+    clientInfo.transport === "ws" &&
+    !clientInfo.authenticated &&
+    ["detection", "sync_response", "ping"].includes(type)
+  ) {
     logger.warn(`[Device] Ignoring unauthenticated "${type}" packet from ${remoteAddress}`);
     return;
   }
