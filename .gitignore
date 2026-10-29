@@ -54,3 +54,6 @@ Thumbs.db
 .env.*
 !.env.example
 *.pem
+
+# Local data dumps (contain private data)
+*.sql

@@ -30,6 +30,9 @@ services:
         value: "false"
       - key: COOKIE_SECURE
         value: "true"
+      # Controllers keep local wall-clock time; Render runs in UTC. 330 = India (UTC+5:30).
+      - key: DEVICE_TZ_OFFSET_MINUTES
+        value: "330"
       - key: DATABASE_URL # Neon connection string (…?sslmode=require)
         sync: false
       - key: ADMIN_USERNAME

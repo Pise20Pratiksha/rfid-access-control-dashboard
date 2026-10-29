@@ -36,11 +36,22 @@ export interface ConnectedClient {
 const connectedClients = new Map<string, ConnectedClient>();
 let tcpServerInstance: net.Server | null = null;
 
+// The ESP32 RTC holds local wall-clock time. A cloud host runs in UTC, so set
+// DEVICE_TZ_OFFSET_MINUTES (e.g. 330 for India, UTC+5:30) there. When unset, the
+// server's own timezone is used (correct for a local PC in the same timezone).
+const rawTzOffset = process.env.DEVICE_TZ_OFFSET_MINUTES?.trim();
+const DEVICE_TZ_OFFSET_MIN =
+  rawTzOffset && !Number.isNaN(Number(rawTzOffset)) ? Number(rawTzOffset) : null;
+
 /**
  * Format Date into DD/MM/YYYY HH:MM:SS format expected by ESP32 DS3231 RTC
  */
 export function formatESP32DateTime(d: Date = new Date()): string {
   const pad = (n: number) => String(n).padStart(2, "0");
+  if (DEVICE_TZ_OFFSET_MIN !== null) {
+    const t = new Date(d.getTime() + DEVICE_TZ_OFFSET_MIN * 60_000);
+    return `${pad(t.getUTCDate())}/${pad(t.getUTCMonth() + 1)}/${t.getUTCFullYear()} ${pad(t.getUTCHours())}:${pad(t.getUTCMinutes())}:${pad(t.getUTCSeconds())}`;
+  }
   const day = pad(d.getDate());
   const month = pad(d.getMonth() + 1);
   const year = d.getFullYear();
@@ -62,7 +73,10 @@ export function parseESP32DateTime(dateStr?: string, timeStr?: string): Date {
       const [day, month, year] = parts;
       const [hour, minute, second] = timeParts;
       if (![day, month, year, hour, minute, second].some((n) => isNaN(n))) {
-        const d = new Date(year, month - 1, day, hour, minute, second);
+        const d =
+          DEVICE_TZ_OFFSET_MIN !== null
+            ? new Date(Date.UTC(year, month - 1, day, hour, minute, second) - DEVICE_TZ_OFFSET_MIN * 60_000)
+            : new Date(year, month - 1, day, hour, minute, second);
         if (!isNaN(d.getTime())) return d;
       }
     }
