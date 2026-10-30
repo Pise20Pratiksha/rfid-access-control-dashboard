@@ -38,12 +38,16 @@
 //  CONNECTION MODE
 //  0 = LAN only   : UDP + mDNS discovery, raw TCP to the local server
 //  1 = CLOUD only : wss://CLOUD_HOST/api/device-ws (works from any Wi-Fi)
-//  2 = AUTO       : try the local LAN server first, fall back to the cloud
-//                   when it is not found (recommended: works at home AND away)
+//  2 = AUTO FAILOVER (recommended): uses the preferred server, switches to the
+//      other one by itself when it is unreachable, and switches back when the
+//      preferred one returns. No re-flashing, no manual change.
 //  Modes 1 and 2 need the Arduino library "WebSockets" by Markus Sattler (2.4+).
 // ─────────────────────────────────────────────────────────────
-#define CLOUD_MODE 0
-#define LAN_PROBES_BEFORE_CLOUD 3   // ~6 s of failed LAN discovery, then use cloud
+#define CLOUD_MODE 2
+#define PREFER_CLOUD 1              // mode 2: 1 = cloud first, local as backup; 0 = local first
+#define LAN_PROBES_BEFORE_CLOUD 3   // local target: ~6 s without an answer, then try the cloud
+#define CLOUD_FAILS_BEFORE_LAN 2    // cloud target: failed connects before trying the local server
+#define FAILBACK_CHECK_MS 60000UL   // while on the backup, re-check the preferred server this often
 #if CLOUD_MODE
   #include <WebSocketsClient.h>
   #define CLOUD_HOST "rfid-access-control.onrender.com"   // no https://, no trailing slash
@@ -93,8 +97,14 @@ const unsigned long DEDUP_MS     = 300000UL; // 5 minutes duplicate filter
 //  NETWORK CONFIGURATION (Wi-Fi + Hostname + TCP + Auth)
 // ─────────────────────────────────────────────────────────────
 // Wi-Fi Station credentials (SPJ Wi-Fi Router)
-const char* WIFI_SSID = "spjetpl";
-const char* WIFI_PASS = "spjetplpune123";
+// Real values live in secrets.h (git-ignored). Copy secrets.example.h to secrets.h and edit it.
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#else
+  #include "secrets.example.h"
+#endif
+const char* WIFI_SSID = SECRET_WIFI_SSID;
+const char* WIFI_PASS = SECRET_WIFI_PASS;
 
 // Fallback SoftAP credentials if router is unreachable
 const char* AP_SSID = "GateLogger";
@@ -114,7 +124,7 @@ const uint16_t UDP_DISCOVERY_PORT = 5002;
 
 // Secure pre-shared authentication key (must equal the server's DEVICE_AUTH_SECRET).
 // Replace with the secret you set on Render before flashing; never commit the real value.
-const char* DEVICE_AUTH_KEY       = "CHANGE_ME_DEVICE_AUTH_SECRET";
+const char* DEVICE_AUTH_KEY       = SECRET_DEVICE_AUTH_KEY;
 
 // Timers and intervals
 const unsigned long DISCOVERY_PROBE_INTERVAL_MS = 2000;  // Probe every 2s during discovery
@@ -292,17 +302,17 @@ RTC_DS3231       rtc;
 
 WiFiUDP          udpDiscovery;
 #if CLOUD_MODE
-bool    cloudFallback = false;   // true = current session goes through the cloud
+bool    targetIsCloud = (CLOUD_MODE == 1) || (PREFER_CLOUD != 0);   // true = this session uses the cloud
 uint8_t lanProbeCount = 0;
 
 // Drop-in replacement for WiFiClient. Same newline-delimited JSON protocol,
 // carried either over raw TCP (LAN) or one message per WebSocket text frame
-// over TLS (wss://, cloud) depending on cloudFallback.
+// over TLS (wss://, cloud) depending on targetIsCloud.
 class HybridClient {
 public:
   bool connect(IPAddress ip, uint16_t port) {
     _rx = ""; _out = ""; _up = false;
-    _cloud = (CLOUD_MODE == 1) || cloudFallback;
+    _cloud = (CLOUD_MODE == 1) || targetIsCloud;
     if (!_cloud) return _tcp.connect(ip, port);
 #ifdef CLOUD_ROOT_CA
     _ws.beginSslWithCA(CLOUD_HOST, CLOUD_PORT, CLOUD_PATH, CLOUD_ROOT_CA);
@@ -326,7 +336,7 @@ public:
     _ws.setReconnectInterval(5000);
     _ws.enableHeartbeat(15000, 5000, 2);   // WS ping/pong keeps NAT + proxy alive
     unsigned long start = millis();
-    while (!_up && millis() - start < 8000) { _ws.loop(); delay(10); }
+    while (!_up && millis() - start < 5000) { _ws.loop(); delay(10); }
     return _up;
   }
   void setNoDelay(bool v) { if (!_cloud) _tcp.setNoDelay(v); }
@@ -378,6 +388,48 @@ HybridClient     tcpClient;
 WiFiClient       tcpClient;
 #endif
 WebServer        server(80);
+
+// Back to the preferred server (called whenever a session ends).
+void resetTargetToPreferred() {
+#if CLOUD_MODE == 2
+  targetIsCloud = (PREFER_CLOUD != 0);
+  lanProbeCount = 0;
+#endif
+}
+
+// Text for the display / web page: which server are we using?
+String serverLabel() {
+#if CLOUD_MODE
+  if (CLOUD_MODE == 1 || targetIsCloud) return String("CLOUD ") + CLOUD_HOST;
+#endif
+  return serverIP.toString() + ":" + String(serverPort);
+}
+
+String onlineLabel() {
+#if CLOUD_MODE
+  return (CLOUD_MODE == 1 || targetIsCloud) ? String("Online: Cloud") : String("Online: Local");
+#else
+  return String("Online (Auth OK)");
+#endif
+}
+
+// Is the preferred server reachable again? (used only while on the backup)
+bool preferredReachable() {
+#if CLOUD_MODE == 2
+  if (PREFER_CLOUD) {
+    WiFiClient t;
+    bool ok = t.connect(CLOUD_HOST, CLOUD_PORT, 1500);
+    t.stop();
+    return ok;
+  }
+  String n = String(APP_HOSTNAME);
+  if (n.endsWith(".local")) n = n.substring(0, n.length() - 6);
+  IPAddress ip = MDNS.queryHost(n.c_str(), 400);
+  return ip != INADDR_NONE && ip != IPAddress(0, 0, 0, 0);
+#else
+  return false;
+#endif
+}
 
 int              totalDetect         = 0;
 bool             tagScreenActive     = false;
@@ -647,6 +699,10 @@ void serviceIncomingUDPDiscovery() {
   int len = udpDiscovery.read(buf, sizeof(buf) - 1);
   if (len <= 0) return;
   buf[len] = '\0';
+#if CLOUD_MODE
+  // Local-server beacons are irrelevant while the cloud is the active target.
+  if (CLOUD_MODE == 1 || targetIsCloud) return;
+#endif
   String msg = String(buf);
 
   String hostStr = extractJsonString(msg, "host");
@@ -699,15 +755,25 @@ void sendDiscoveryProbeUDP() {
   idleNeedsFullRedraw = true;
   return;
 #elif CLOUD_MODE == 2
-  // Auto: probe the LAN a few times; if no local server answers, use the cloud.
-  if (cloudFallback || ++lanProbeCount > LAN_PROBES_BEFORE_CLOUD) {
-    cloudFallback = true;
+  // Auto failover: the cloud is a fixed hostname; the local server is discovered.
+  if (targetIsCloud) {
     hostnameResolved = true;
     networkStatusText = "Cloud Server";
     netState = STATE_CONNECTING_TCP;
     lastTcpAttemptMs = 0;
     idleNeedsFullRedraw = true;
-    DBGLN("[Discovery] No LAN server found, using cloud server");
+    DBGLN("[Discovery] Target: CLOUD server");
+    return;
+  }
+  if (++lanProbeCount > LAN_PROBES_BEFORE_CLOUD) {
+    targetIsCloud = true;
+    lanProbeCount = 0;
+    hostnameResolved = true;
+    networkStatusText = "Cloud Server";
+    netState = STATE_CONNECTING_TCP;
+    lastTcpAttemptMs = 0;
+    idleNeedsFullRedraw = true;
+    DBGLN("[Failover] No local server found, switching to CLOUD server");
     return;
   }
 #endif
@@ -767,7 +833,7 @@ void attemptTCPConnect() {
   }
 
 #if CLOUD_MODE
-  if (CLOUD_MODE == 1 || cloudFallback) {
+  if (CLOUD_MODE == 1 || targetIsCloud) {
     DBG("[Cloud] Connecting to wss://"); DBG(CLOUD_HOST); DBGLN(CLOUD_PATH);
   } else
 #endif
@@ -787,7 +853,7 @@ void attemptTCPConnect() {
     tcpConnectFailCount = 0;
     resolveFailCount = 0;
 #if CLOUD_MODE == 2
-    if (!cloudFallback) lanProbeCount = 0;   // LAN works: keep preferring it
+    if (!targetIsCloud) lanProbeCount = 0;   // LAN works: keep preferring it
 #endif
     lastPingSentMs = millis();
     lastServerRxMs = millis();
@@ -805,7 +871,18 @@ void attemptTCPConnect() {
     DBG("[TCP] Connect failed, attempt "); DBGLN(tcpConnectFailCount);
 
     // If connect repeatedly fails, server IP might have changed on DHCP router
-    if (tcpConnectFailCount >= 3) {
+    int failLimit = 3;
+#if CLOUD_MODE == 2
+    if (targetIsCloud) failLimit = CLOUD_FAILS_BEFORE_LAN;
+#endif
+    if (tcpConnectFailCount >= failLimit) {
+#if CLOUD_MODE == 2
+      if (targetIsCloud) {
+        targetIsCloud = false;
+        lanProbeCount = 0;
+        DBGLN("[Failover] Cloud unreachable, switching to LOCAL server");
+      }
+#endif
       DBGLN("[TCP] Connect retries exceeded. Re-discovering server...");
       hostnameResolved = false;
       tcpConnectFailCount = 0;
@@ -849,7 +926,8 @@ void handleServerMessage(const String& line) {
     if (status == "authenticated") {
       isAuthenticated = true;
       netState = STATE_CONNECTED;
-      networkStatusText = "Online (Auth OK)";
+      networkStatusText = onlineLabel();
+      DBG("[Server] Using: "); DBGLN(serverLabel());
       idleNeedsFullRedraw = true;
       DBGLN("[TCP] Device authenticated successfully by server!");
 
@@ -959,6 +1037,7 @@ void serviceTCPClient() {
   if (!tcpClient.connected()) {
     DBGLN("[TCP] Disconnected from server. Re-discovering in case IP changed...");
     tcpClient.stop();
+    resetTargetToPreferred();
     isAuthenticated = false;
     hostnameResolved = false;
     netState = STATE_DISCOVERING_SERVER;
@@ -988,6 +1067,27 @@ void serviceTCPClient() {
     }
   }
 
+#if CLOUD_MODE == 2
+  // Failback: on the backup server, periodically check whether the preferred one is back.
+  static unsigned long lastFailbackCheckMs = 0;
+  if (netState == STATE_CONNECTED && targetIsCloud != (PREFER_CLOUD != 0) &&
+      now - lastFailbackCheckMs >= FAILBACK_CHECK_MS) {
+    lastFailbackCheckMs = now;
+    if (preferredReachable()) {
+      DBGLN("[Failover] Preferred server is back, switching to it");
+      tcpClient.stop();
+      isAuthenticated = false;
+      resetTargetToPreferred();
+      hostnameResolved = false;
+      netState = STATE_DISCOVERING_SERVER;
+      lastDiscoveryAttemptMs = 0;
+      networkStatusText = "Switching server";
+      idleNeedsFullRedraw = true;
+      return;
+    }
+  }
+#endif
+
   // Periodic keepalive ping (every 15s)
   if (netState == STATE_CONNECTED && now - lastPingSentMs >= TCP_PING_INTERVAL_MS) {
     lastPingSentMs = now;
@@ -1001,6 +1101,7 @@ void serviceTCPClient() {
   if (now - lastServerRxMs >= TCP_RX_TIMEOUT_MS) {
     DBGLN("[TCP] Keepalive timeout! Tearing down half-open socket and re-discovering...");
     tcpClient.stop();
+    resetTargetToPreferred();
     isAuthenticated = false;
     hostnameResolved = false;
     netState = STATE_DISCOVERING_SERVER;
@@ -1049,10 +1150,7 @@ void serviceNetwork() {
     if (WiFi.status() != WL_CONNECTED) {
       if (netState != STATE_WIFI_DISCONNECTED) {
         DBGLN("[WiFi] Connection dropped!");
-#if CLOUD_MODE == 2
-        cloudFallback = false;
-        lanProbeCount = 0;
-#endif
+        resetTargetToPreferred();
         tcpClient.stop();
         isAuthenticated = false;
         hostnameResolved = false;
@@ -1146,7 +1244,7 @@ void handleRoot() {
     "<p>Device ID: <b>" + getPermanentDeviceId() + "</b></p>"
     "<p>MAC Address: <b>" + deviceMacAddress + "</b></p>"
     "<p>Local IP: <b>" + ipString + "</b></p>"
-    "<p>Target Server: <b>" + (hostnameResolved ? serverIP.toString() + ":" + String(serverPort) : "Discovering...") + "</b></p>"
+    "<p>Target Server: <b>" + (hostnameResolved ? serverLabel() : String("Discovering...")) + "</b></p>"
     "<p>Status: <b>" + networkStatusText + "</b></p>"
     "<p>Records buffered: <b>" + String(nvsCount) + " / " + String(MAX_RECORDS) + "</b></p>"
     "<p>Total detections: <b>" + String(totalDetect) + "</b></p>"
@@ -1355,9 +1453,7 @@ void showIdleScreen() {
     tft.setTextColor(hostnameResolved ? ILI9341_GREEN : ILI9341_YELLOW);
     tft.setCursor(80, 195);
     if (hostnameResolved) {
-      tft.print(serverIP.toString());
-      tft.print(":");
-      tft.print(serverPort);
+      tft.print(serverLabel().substring(0, 22));
     } else {
       tft.print("Discovering...");
     }

@@ -136,6 +136,29 @@ At the office the board joins the local server; anywhere else (any Wi-Fi with
 internet) it joins the cloud. The local and cloud dashboards keep separate
 databases. The TFT shows "Cloud Server" when it falls back to the cloud.
 
+### Wi-Fi and key live in `secrets.h`
+
+Copy `firmware/dual_rfid_gate_logger/secrets.example.h` to `secrets.h` (same
+folder) and set `SECRET_WIFI_SSID`, `SECRET_WIFI_PASS` and
+`SECRET_DEVICE_AUTH_KEY`. `secrets.h` is git-ignored, so it is never pushed.
+
+### Automatic failover (CLOUD_MODE 2)
+
+The board prefers the cloud (`PREFER_CLOUD 1`; set `0` to prefer your local
+server) and needs no re-flashing to move between them:
+
+| Situation | What the board does |
+|---|---|
+| Cloud reachable | Uses the cloud (Serial: `Online: Cloud`) |
+| Cloud down / Render asleep / no internet | After ~15 s switches to the local server (`[Failover] Cloud unreachable, switching to LOCAL server`) |
+| Running on the backup | Every 60 s checks the preferred server; when it is back it switches over |
+| Any dropped session | Starts again from the preferred server |
+
+Scans made while on one server stay in the board's flash until a server syncs
+them, so after a switch the new server receives the recent scans too
+(duplicates are skipped). The two databases are otherwise independent.
+To use the local server, run `pnpm run dev` on the same Wi-Fi.
+
 ## Testing
 
 Replace `HOST` with your Render hostname.
